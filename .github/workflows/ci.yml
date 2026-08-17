@@ -1,0 +1,153 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  # Use the workflow from protected `main`, so a pull request cannot remove
+  # the approval gate before it is allowed to use paid Cloudflare compute.
+  pull_request_target:
+    branches: [main]
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  select-cloudflare-ci-environment:
+    name: Select Cloudflare CI approval
+    runs-on: ubuntu-latest
+    outputs:
+      name: ${{ steps.select.outputs.name }}
+      requires_approval: ${{ steps.select.outputs.requires_approval }}
+    steps:
+      - id: select
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" != "pull_request_target" ]; then
+            echo 'name=cloudflare-ci' >> "$GITHUB_OUTPUT"
+            echo 'requires_approval=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          permission="$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            "/repos/$GITHUB_REPOSITORY/collaborators/$PR_AUTHOR/permission" \
+            --jq '.permission' 2>/dev/null || true)"
+
+          if [ "$permission" = 'admin' ]; then
+            echo 'name=cloudflare-ci' >> "$GITHUB_OUTPUT"
+            echo 'requires_approval=false' >> "$GITHUB_OUTPUT"
+          else
+            # Fail closed: an API error or a non-admin author is reviewed by a
+            # repository admin through the protected environment.
+            echo 'name=cloudflare-ci-approval' >> "$GITHUB_OUTPUT"
+            echo 'requires_approval=true' >> "$GITHUB_OUTPUT"
+          fi
+
+  approve-cloudflare-ci:
+    name: Approve Cloudflare CI
+    needs: select-cloudflare-ci-environment
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ needs.select-cloudflare-ci-environment.outputs.name }}
+      # This is a CI admission gate, not a deployment record.
+      deployment: false
+    steps:
+      - name: Verify the approval protection rule
+        if: needs.select-cloudflare-ci-environment.outputs.requires_approval == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          reviewer_count="$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            "/repos/$GITHUB_REPOSITORY/environments/cloudflare-ci-approval" \
+            --jq '[.protection_rules[] | select(.type == "required_reviewers") | .reviewers[]?] | length')"
+
+          if [ "$reviewer_count" -eq 0 ]; then
+            echo 'Cloudflare CI is blocked: cloudflare-ci-approval must have a repository administrator configured as a required reviewer.' >&2
+            exit 1
+          fi
+
+      - env:
+          REQUIRES_APPROVAL: ${{ needs.select-cloudflare-ci-environment.outputs.requires_approval }}
+        run: |
+          if [ "$REQUIRES_APPROVAL" = 'true' ]; then
+            echo 'A repository administrator approved this pull request for Cloudflare CI.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'The pull-request author is a repository administrator; Cloudflare CI is authorized.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  ci:
+    name: CI (${{ matrix.runner_index }})
+    needs: approve-cloudflare-ci
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        runner_index: [1, 2]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # `pull_request_target` uses this trusted workflow from `main`. Check
+      # out the pull-request merge ref only after the approval gate above.
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'pull_request_target' && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.sha }}
+      - name: Enable pnpm
+        run: corepack enable
+      - name: Resolve pnpm store
+        id: pnpm-store
+        run: echo "path=$(pnpm store path)" >> "$GITHUB_OUTPUT"
+      - name: Restore pnpm cache
+        id: pnpm-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: pnpm-linux-x64-node-22-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            pnpm-linux-x64-node-22-
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --prefer-offline
+      - name: Save pnpm cache
+        if: matrix.runner_index == 1 && steps.pnpm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: pnpm-linux-x64-node-22-${{ hashFiles('pnpm-lock.yaml') }}
+      - name: Check
+        run: pnpm run check
+      - name: Test
+        run: pnpm test
+      - name: Check published package contents
+        run: npm pack --dry-run
+
+  runner-image-size:
+    name: Runner image under 1.5 GB
+    needs: approve-cloudflare-ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # Match the revision exercised by the parallel CI jobs.
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'pull_request_target' && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.sha }}
+      - name: Build and check runner image size
+        run: ./tests/runner-image-size.sh
+
+  publish:
+    needs:
+      - ci
+      - runner-image-size
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/publish.yml
+    permissions:
+      contents: write
+      id-token: write

@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "skills": {
+    "conductor-setup": {
+      "source": "biw/skills",
+      "sourceType": "github",
+      "skillPath": "skills/conductor-setup/SKILL.md",
+      "computedHash": "946ccb7c75b0d1edbd64a88b5701ded25988d16a987835843aec651f02e855ef"
+    },
+    "install-anti-slop": {
+      "source": "dmmulroy/anti-slop",
+      "sourceType": "github",
+      "skillPath": "skills/install-anti-slop/SKILL.md",
+      "computedHash": "8c03582ef9b14d0034d6a21da154449f7b9e6618900fb19886008982b3453f90"
+    },
+    "review-fix-address-bots": {
+      "source": "biw/skills",
+      "sourceType": "github",
+      "skillPath": "skills/review-fix-address-bots/SKILL.md",
+      "computedHash": "47c01eb738ad570ee9269f8c60590a1d1c2f7e394df3b763d4979c13da045986"
+    }
+  }
+}

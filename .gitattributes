@@ -1,0 +1,2 @@
+# Wrangler-generated runtime declarations contain intentional template whitespace.
+worker-configuration.d.ts -whitespace

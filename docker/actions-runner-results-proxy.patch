@@ -1,0 +1,32 @@
+diff --git a/src/Runner.Worker/Handlers/NodeScriptActionHandler.cs b/src/Runner.Worker/Handlers/NodeScriptActionHandler.cs
+index e53d17c0..5eb4025a 100644
+--- a/src/Runner.Worker/Handlers/NodeScriptActionHandler.cs
++++ b/src/Runner.Worker/Handlers/NodeScriptActionHandler.cs
+@@ -71,4 +71,26 @@ namespace GitHub.Runner.Worker.Handlers
+             if (systemConnection.Data.TryGetValue("ResultsServiceUrl", out var resultsUrl) && !string.IsNullOrEmpty(resultsUrl))
+             {
+-                Environment["ACTIONS_RESULTS_URL"] = resultsUrl;
++                var resultsProxyUrl = System.Environment.GetEnvironmentVariable("CF_RUNNER_RESULTS_PROXY_URL");
++                var resultsProxyUpstreamPath = System.Environment.GetEnvironmentVariable("CF_RUNNER_RESULTS_PROXY_UPSTREAM_PATH");
++                if (!string.IsNullOrEmpty(resultsProxyUrl) && !string.IsNullOrEmpty(resultsProxyUpstreamPath))
++                {
++                    try
++                    {
++                        File.WriteAllText(resultsProxyUpstreamPath, resultsUrl);
++                        Environment["ACTIONS_RESULTS_URL"] = resultsProxyUrl;
++                        // GitHub does not always set this feature flag for self-hosted
++                        // runners. The cache proxy implements CacheService v2, so opt in
++                        // whenever the local Results Service proxy is configured.
++                        Environment["ACTIONS_CACHE_SERVICE_V2"] = bool.TrueString;
++                    }
++                    catch (Exception ex)
++                    {
++                        Trace.Warning($"Cloudflare results proxy was unavailable; preserving the GitHub results endpoint: {ex.Message}");
++                        Environment["ACTIONS_RESULTS_URL"] = resultsUrl;
++                    }
++                }
++                else
++                {
++                    Environment["ACTIONS_RESULTS_URL"] = resultsUrl;
++                }
+             }

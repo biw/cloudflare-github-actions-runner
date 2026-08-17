@@ -1,0 +1,80 @@
+{
+  "name": "cloudflare-github-actions-runner",
+  "version": "1.0.6",
+  "description": "Run GitHub Actions jobs as disposable Cloudflare Containers.",
+  "keywords": [
+    "ci",
+    "cloudflare",
+    "containers",
+    "github-actions",
+    "self-hosted-runner"
+  ],
+  "homepage": "https://github.com/biw/cloudflare-github-actions-runner#readme",
+  "bugs": {
+    "url": "https://github.com/biw/cloudflare-github-actions-runner/issues"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/biw/cloudflare-github-actions-runner.git"
+  },
+  "bin": {
+    "cloudflare-github-actions-runner": "./dist/cloudflare-github-actions-runner.mjs"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "docker",
+    "scripts",
+    "src",
+    "wrangler.jsonc"
+  ],
+  "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "setup": "vp exec tsx bin/cloudflare-github-actions-runner.ts setup",
+    "teardown": "vp exec tsx bin/cloudflare-github-actions-runner.ts teardown",
+    "build": "vp pack",
+    "check": "vp check",
+    "format": "vp fmt",
+    "format:check": "vp fmt --check",
+    "lint": "vp lint",
+    "lint:fix": "vp lint --fix",
+    "test": "vp test",
+    "deploy": "vp exec tsx scripts/deploy.ts",
+    "deploy:dry-run": "vp exec tsx scripts/deploy.ts --dry-run",
+    "resource-traces": "vp exec tsx scripts/resource-metrics.ts",
+    "cf-typegen": "vp exec wrangler types",
+    "prepack": "vp pack",
+    "prepublishOnly": "vp check && vp test"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "^0.3.7",
+    "@inquirer/prompts": "^8.5.2",
+    "tsx": "^4.23.12",
+    "wrangler": "^4.121.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.21.3",
+    "@oxlint/plugins": "1.78.0",
+    "@types/node": "^26.2.0",
+    "oxlint": "1.78.0",
+    "typescript": "^5.9.3",
+    "vite": "catalog:",
+    "vite-plus": "catalog:",
+    "vitest": "catalog:"
+  },
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "11.22.0",
+      "onFail": "warn"
+    }
+  },
+  "engines": {
+    "node": "^20.19.0 || >=22.13.0"
+  }
+}

@@ -1,0 +1,6 @@
+interface:
+  display_name: "Conductor Setup"
+  short_description: "Configure Conductor project settings and workspace scripts"
+  default_prompt: "Use $conductor-setup to configure .conductor/settings.toml, migrate legacy conductor.json, and set up local/cloud workspace scripts."
+policy:
+  allow_implicit_invocation: true

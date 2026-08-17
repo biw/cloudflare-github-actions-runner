@@ -1,0 +1,17 @@
+allowBuilds:
+  esbuild: true
+  workerd: true
+catalog:
+  vite: npm:@voidzero-dev/vite-plus-core@0.2.8
+  vitest: 4.1.10
+  vite-plus: 0.2.8
+overrides:
+  vite: "catalog:"
+  vitest: "catalog:"
+peerDependencyRules:
+  allowAny:
+    - vite
+    - vitest
+  allowedVersions:
+    vite: "*"
+    vitest: "*"

@@ -1,0 +1,338 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "cloudflare-github-actions-runner",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-12",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "observability": {
+    "enabled": true,
+  },
+  "d1_databases": [
+    {
+      "binding": "RESOURCE_METRICS",
+      "database_name": "cloudflare-github-actions-runner-metrics",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "src/migrations",
+    },
+  ],
+  "r2_buckets": [
+    {
+      "binding": "RUNNER_CACHE",
+      "bucket_name": "cloudflare-github-actions-runner-cache",
+    },
+    {
+      "binding": "RUNNER_IMAGE_SOURCE",
+      "bucket_name": "cloudflare-github-actions-runner-cache",
+    },
+  ],
+  "vars": {
+    // Only used to migrate the original single-repository POC token. New
+    // repositories are selected by `pnpm run setup` and use owner-scoped secrets.
+    "LEGACY_GITHUB_OWNER": "biw",
+    "LEGACY_GITHUB_REPOSITORY": "cloudflare-github-actions-runner",
+    "GITHUB_RUNNER_GROUP_ID": "1",
+    "RUNNER_APPLICATION_PREFIX": "cloudflare-github-actions-runner",
+    "CUSTOM_RUNNER_APPLICATION": "cloudflare-github-actions-runner-custom",
+    "RUNNER_IMAGE_BUILDER_APPLICATION": "cloudflare-github-actions-runner-image-builder",
+    "RUNNER_IMAGE_BUILDER_IMAGE_NAME": "cloudflare-github-actions-runner-image-builder",
+    // Replaced with a new opaque value by each deployment. It makes the
+    // Workflow re-verify the pinned private builder manifest after a deploy.
+    "RUNNER_IMAGE_BUILDER_BOOTSTRAP_DEPLOYMENT_ID": "unconfigured",
+    "RUNNER_IMAGE_NAME": "cloudflare-github-actions-runner-runner",
+    "RUNNER_IMAGE_SOURCE_REPOSITORY": "biw/cloudflare-github-actions-runner",
+    "RUNNER_IMAGE_SOURCE_REF": "main",
+    "RUNNER_CACHE_ENABLED": "true",
+    "RUNNER_CACHE_MAX_BYTES": "100000000000",
+    "RUNNER_CACHE_PREFIX": "cloudflare-github-actions-runner",
+  },
+  "containers": [
+    {
+      "name": "cloudflare-github-actions-runner-image-builder",
+      "class_name": "RunnerImageBuilder",
+      "image": "docker.io/library/ubuntu:24.04",
+      "instance_type": { "vcpu": 4, "memory_mib": 12288, "disk_mb": 20000 },
+      "max_instances": 1,
+    },
+    {
+      "name": "cloudflare-github-actions-runner-githubactionsrunnerlite",
+      "class_name": "GitHubActionsRunnerLite",
+      "image": "docker.io/library/ubuntu:24.04",
+      "instance_type": "lite",
+      "max_instances": 1,
+    },
+    {
+      "name": "cloudflare-github-actions-runner-validation",
+      "class_name": "GitHubActionsRunnerValidation",
+      "image": "docker.io/library/ubuntu:24.04",
+      "instance_type": "basic",
+      "max_instances": 1,
+    },
+    {
+      "name": "cloudflare-github-actions-runner-githubactionsrunnerbasic",
+      "class_name": "GitHubActionsRunnerBasic",
+      "image": "docker.io/library/ubuntu:24.04",
+      "instance_type": "basic",
+      "max_instances": 1,
+    },
+    {
+      "name": "cloudflare-github-actions-runner-githubactionsrunnerstandard1",
+      "class_name": "GitHubActionsRunnerStandard1",
+      "image": "docker.io/library/ubuntu:24.04",
+      "instance_type": "standard-1",
+      "max_instances": 1,
+    },
+    {
+      "name": "cloudflare-github-actions-runner-githubactionsrunnerstandard2",
+      "class_name": "GitHubActionsRunnerStandard2",
+      "image": "docker.io/library/ubuntu:24.04",
+      "instance_type": "standard-2",
+      "max_instances": 1,
+    },
+    {
+      "name": "cloudflare-github-actions-runner-githubactionsrunner",
+      "class_name": "GitHubActionsRunner",
+      "image": "docker.io/library/ubuntu:24.04",
+      "instance_type": "standard-3",
+      "max_instances": 1,
+    },
+    {
+      "name": "cloudflare-github-actions-runner-githubactionsrunnerstandard4",
+      "class_name": "GitHubActionsRunnerStandard4",
+      "image": "docker.io/library/ubuntu:24.04",
+      "instance_type": "standard-4",
+      "max_instances": 1,
+    },
+    {
+      "name": "cloudflare-github-actions-runner-custom",
+      "class_name": "GitHubActionsRunnerCustom",
+      "image": "docker.io/library/ubuntu:24.04",
+      "instance_type": {
+        "vcpu": 4,
+        "memory_mib": 12288,
+        "disk_mb": 4000,
+      },
+      "max_instances": 1,
+    },
+    {
+      "name": "cloudflare-github-actions-runner-custom-2",
+      "class_name": "GitHubActionsRunnerCustom2",
+      "image": "docker.io/library/ubuntu:24.04",
+      "instance_type": { "vcpu": 1, "memory_mib": 3072, "disk_mb": 6000 },
+      "max_instances": 1,
+    },
+    {
+      "name": "cloudflare-github-actions-runner-custom-3",
+      "class_name": "GitHubActionsRunnerCustom3",
+      "image": "docker.io/library/ubuntu:24.04",
+      "instance_type": { "vcpu": 1, "memory_mib": 3072, "disk_mb": 6000 },
+      "max_instances": 1,
+    },
+    {
+      "name": "cloudflare-github-actions-runner-custom-4",
+      "class_name": "GitHubActionsRunnerCustom4",
+      "image": "docker.io/library/ubuntu:24.04",
+      "instance_type": { "vcpu": 1, "memory_mib": 3072, "disk_mb": 6000 },
+      "max_instances": 1,
+    },
+    {
+      "name": "cloudflare-github-actions-runner-custom-5",
+      "class_name": "GitHubActionsRunnerCustom5",
+      "image": "docker.io/library/ubuntu:24.04",
+      "instance_type": { "vcpu": 1, "memory_mib": 3072, "disk_mb": 6000 },
+      "max_instances": 1,
+    },
+    {
+      "name": "cloudflare-github-actions-runner-custom-6",
+      "class_name": "GitHubActionsRunnerCustom6",
+      "image": "docker.io/library/ubuntu:24.04",
+      "instance_type": { "vcpu": 1, "memory_mib": 3072, "disk_mb": 6000 },
+      "max_instances": 1,
+    },
+    {
+      "name": "cloudflare-github-actions-runner-custom-7",
+      "class_name": "GitHubActionsRunnerCustom7",
+      "image": "docker.io/library/ubuntu:24.04",
+      "instance_type": { "vcpu": 1, "memory_mib": 3072, "disk_mb": 6000 },
+      "max_instances": 1,
+    },
+    {
+      "name": "cloudflare-github-actions-runner-custom-8",
+      "class_name": "GitHubActionsRunnerCustom8",
+      "image": "docker.io/library/ubuntu:24.04",
+      "instance_type": { "vcpu": 1, "memory_mib": 3072, "disk_mb": 6000 },
+      "max_instances": 1,
+    },
+    {
+      "name": "cloudflare-github-actions-runner-custom-9",
+      "class_name": "GitHubActionsRunnerCustom9",
+      "image": "docker.io/library/ubuntu:24.04",
+      "instance_type": { "vcpu": 1, "memory_mib": 3072, "disk_mb": 6000 },
+      "max_instances": 1,
+    },
+    {
+      "name": "cloudflare-github-actions-runner-custom-10",
+      "class_name": "GitHubActionsRunnerCustom10",
+      "image": "docker.io/library/ubuntu:24.04",
+      "instance_type": { "vcpu": 1, "memory_mib": 3072, "disk_mb": 6000 },
+      "max_instances": 1,
+    },
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "RUNNER_LITE",
+        "class_name": "GitHubActionsRunnerLite",
+      },
+      {
+        "name": "RUNNER_VALIDATION",
+        "class_name": "GitHubActionsRunnerValidation",
+      },
+      {
+        "name": "RUNNER_BASIC",
+        "class_name": "GitHubActionsRunnerBasic",
+      },
+      {
+        "name": "RUNNER_STANDARD_1",
+        "class_name": "GitHubActionsRunnerStandard1",
+      },
+      {
+        "name": "RUNNER_STANDARD_2",
+        "class_name": "GitHubActionsRunnerStandard2",
+      },
+      {
+        "name": "RUNNER_STANDARD_3",
+        "class_name": "GitHubActionsRunner",
+      },
+      {
+        "name": "RUNNER_STANDARD_4",
+        "class_name": "GitHubActionsRunnerStandard4",
+      },
+      {
+        "name": "RUNNER_CUSTOM",
+        "class_name": "GitHubActionsRunnerCustom",
+      },
+      {
+        "name": "RUNNER_CUSTOM_2",
+        "class_name": "GitHubActionsRunnerCustom2",
+      },
+      {
+        "name": "RUNNER_CUSTOM_3",
+        "class_name": "GitHubActionsRunnerCustom3",
+      },
+      {
+        "name": "RUNNER_CUSTOM_4",
+        "class_name": "GitHubActionsRunnerCustom4",
+      },
+      {
+        "name": "RUNNER_CUSTOM_5",
+        "class_name": "GitHubActionsRunnerCustom5",
+      },
+      {
+        "name": "RUNNER_CUSTOM_6",
+        "class_name": "GitHubActionsRunnerCustom6",
+      },
+      {
+        "name": "RUNNER_CUSTOM_7",
+        "class_name": "GitHubActionsRunnerCustom7",
+      },
+      {
+        "name": "RUNNER_CUSTOM_8",
+        "class_name": "GitHubActionsRunnerCustom8",
+      },
+      {
+        "name": "RUNNER_CUSTOM_9",
+        "class_name": "GitHubActionsRunnerCustom9",
+      },
+      {
+        "name": "RUNNER_CUSTOM_10",
+        "class_name": "GitHubActionsRunnerCustom10",
+      },
+      {
+        "name": "RUNNER_SCHEDULER",
+        "class_name": "AccountRunnerScheduler",
+      },
+      {
+        "name": "RUNNER_ELIGIBILITY_CHECK",
+        "class_name": "RunnerEligibilityCheck",
+      },
+      {
+        "name": "RUNNER_CACHE_QUOTA",
+        "class_name": "RunnerCacheQuota",
+      },
+      {
+        "name": "RUNNER_IMAGE_BUILDER",
+        "class_name": "RunnerImageBuilder",
+      },
+    ],
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["GitHubActionsRunner"],
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": [
+        "GitHubActionsRunnerLite",
+        "GitHubActionsRunnerBasic",
+        "GitHubActionsRunnerStandard1",
+        "GitHubActionsRunnerStandard2",
+        "GitHubActionsRunnerStandard4",
+      ],
+    },
+    {
+      "tag": "v3",
+      "new_sqlite_classes": ["GitHubActionsRunnerCustom"],
+    },
+    {
+      "tag": "v4",
+      "new_sqlite_classes": [
+        "GitHubActionsRunnerCustom2",
+        "GitHubActionsRunnerCustom3",
+        "GitHubActionsRunnerCustom4",
+        "GitHubActionsRunnerCustom5",
+        "GitHubActionsRunnerCustom6",
+        "GitHubActionsRunnerCustom7",
+        "GitHubActionsRunnerCustom8",
+        "GitHubActionsRunnerCustom9",
+        "GitHubActionsRunnerCustom10",
+        "AccountRunnerScheduler",
+      ],
+    },
+    {
+      "tag": "v5",
+      "new_sqlite_classes": ["GitHubActionsRunnerValidation"],
+    },
+    {
+      "tag": "v6",
+      "new_sqlite_classes": ["RunnerCacheQuota"],
+    },
+    {
+      "tag": "v7",
+      "new_sqlite_classes": ["RunnerImageBuilder"],
+    },
+    {
+      "tag": "v8",
+      "new_sqlite_classes": ["RunnerEligibilityCheck"],
+    },
+  ],
+  "workflows": [
+    {
+      "binding": "RUNNER_PROVISIONING_WORKFLOW",
+      "name": "cloudflare-github-actions-runner-provisioning",
+      "class_name": "RunnerProvisioningWorkflow",
+      "limits": {
+        "steps": 300,
+      },
+    },
+    {
+      "binding": "RUNNER_IMAGE_BUILD_WORKFLOW",
+      "name": "cloudflare-github-actions-runner-image-build",
+      "class_name": "RunnerImageBuildWorkflow",
+      "limits": {
+        "steps": 10000,
+      },
+    },
+  ],
+}
