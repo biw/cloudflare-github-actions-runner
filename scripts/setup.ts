@@ -650,7 +650,7 @@ export async function createGitHubAppFromManifest(name, workerBaseUrl, options =
     const port = await listenOnLoopback(server);
     const manifestUrl = `http://127.0.0.1:${port}/github-app/manifest`;
     console.log(
-      `\nOpening GitHub to create the Cloudflare GitHub Actions App${owner === undefined ? "" : ` for ${owner.login}`}...`,
+      `\nOpening GitHub to create the Cloudflare GitHub Actions App${owner === undefined ? "" : ` for ${owner.login}`}: ${manifestUrl}`,
     );
     open(manifestUrl);
     const manifestCode = await Promise.race([
@@ -1629,10 +1629,10 @@ function githubAppInstallUrl(slug) {
 
 async function installGitHubApp(slug, workerBaseUrl, setupValidationToken, githubRunnerOwner, pending = false) {
   const installUrl = githubAppInstallUrl(slug);
-  console.log("\nOpening the GitHub App installation page...");
+  console.log(`\nOpening the GitHub App installation page: ${installUrl}`);
   console.log(
     `Install the App on ${githubOwnerLabel(githubRunnerOwner)} and select All repositories.\n` +
-      `If a browser did not open, use:\n${installUrl}`,
+      "If a browser did not open, use the link above.",
   );
   openExternalUrl(installUrl);
 
