@@ -19,13 +19,14 @@ RUN git apply /tmp/actions-runner-results-proxy.patch \
   && cd src \
   && ./dev.sh layout Release
 
-# GitHub.com now executes JavaScript actions with Node 24. This runner cannot
-# execute Docker container actions, so the Node copies used only inside Alpine
-# container steps are unreachable. Prune them in the builder stage so they are
-# absent from the final image layer instead of hidden behind whiteouts.
-RUN test -x /opt/actions-runner-source/_layout/externals/node24/bin/node \
+# The runner invokes node20 to evaluate workflow expressions (for example,
+# hashFiles()) and can still execute Node 20 actions during GitHub's temporary
+# Node 24 opt-out. This runner cannot execute Docker container actions, so only
+# the Node copies used inside Alpine container steps are unreachable. Prune
+# those in the builder stage so they are absent from the final image layer.
+RUN test -x /opt/actions-runner-source/_layout/externals/node20/bin/node \
+  && test -x /opt/actions-runner-source/_layout/externals/node24/bin/node \
   && rm -rf \
-    /opt/actions-runner-source/_layout/externals/node20 \
     /opt/actions-runner-source/_layout/externals/node20_alpine \
     /opt/actions-runner-source/_layout/externals/node24_alpine
 
@@ -51,20 +52,22 @@ RUN apt-get update \
     ca-certificates \
     cmake \
     curl \
-    git \
-    git-lfs \
     jq \
     ninja-build \
     openssh-client \
     pkg-config \
     python3 \
     rsync \
+    software-properties-common \
     tini \
     unzip \
     wget \
     xz-utils \
     zip \
     zstd \
+  && add-apt-repository --yes ppa:git-core/ppa \
+  && apt-get update \
+  && apt-get install --yes --no-install-recommends git git-lfs \
   && useradd --create-home --shell /bin/bash runner \
   && mkdir --parents /home/runner/actions-runner \
   && mkdir --parents "${RUNNER_TOOL_CACHE}/node/${NODE_VERSION}" \
