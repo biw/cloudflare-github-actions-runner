@@ -1,5 +1,9 @@
 # Cloudflare Containers GitHub Actions Runner
 
+[![CI](https://badgen.net/github/checks/biw/cloudflare-github-actions-runner)](https://github.com/biw/cloudflare-github-actions-runner/actions)
+[![npm version](https://badgen.net/npm/v/cloudflare-github-actions-runner)](https://www.npmjs.com/package/cloudflare-github-actions-runner)
+[![npm downloads](https://badgen.net/npm/dt/cloudflare-github-actions-runner)](https://www.npmjs.com/package/cloudflare-github-actions-runner)
+
 Run GitHub Actions jobs in an ephemeral [Cloudflare Containers](https://developers.cloudflare.com/containers/). A signed GitHub App `workflow_job` webhook provisions a repository-scoped GitHub [just-in-time runner](https://docs.github.com/en/actions/reference/security/secure-use#using-just-in-time-runners).
 
 ## Quick start
