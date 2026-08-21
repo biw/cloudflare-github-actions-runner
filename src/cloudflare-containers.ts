@@ -92,6 +92,13 @@ export interface RolloutRunnerApplicationImagesOptions {
    * recent PATCH reached its own rollout (for example A→B→A).
    */
   reissueMatchingImageRollouts?: boolean;
+  /** Reports how many runner applications this rollout pass has inspected. */
+  onProgress?: (progress: RunnerApplicationImageRolloutProgress) => Promise<void>;
+}
+
+export interface RunnerApplicationImageRolloutProgress {
+  processedApplications: number;
+  totalApplications: number;
 }
 
 export interface RolloutRunnerImageBuilderOptions {
@@ -450,60 +457,78 @@ export async function rolloutRunnerApplicationImages(
   );
   const updatedApplications: string[] = [];
   const skippedApplications: string[] = [];
+  const reportProgress = async (progress: RunnerApplicationImageRolloutProgress): Promise<void> => {
+    try {
+      await options.onProgress?.(progress);
+    } catch (error) {
+      // Progress is telemetry for the setup UI, not part of the Container API
+      // transaction. A transient Durable Object error must not repeat a
+      // successful rollout or abandon the build lease.
+      console.error("Cloudflare runner image rollout progress reporting failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  };
+  await reportProgress({ processedApplications: 0, totalApplications: applications.length });
 
-  for (const listedApplication of applications) {
-    // The scheduler can resize an idle custom application while an image build
-    // is finishing. Re-read its configuration immediately before patching so
-    // an image rollout never writes the stale resources from the initial list.
-    // eslint-disable-next-line no-await-in-loop -- obtain the current configuration for this exact application.
-    const application = await findRunnerApplication(env, listedApplication.name, dependencies);
-    // eslint-disable-next-line no-await-in-loop -- a configuration rollout must be observed before the next application.
-    const rollouts = await listRollouts(env, application.id, dependencies);
-    if (rollouts.some((rollout) => rollout.status === "pending" || rollout.status === "progressing")) {
-      skippedApplications.push(application.name);
-      continue;
+  for (const [index, listedApplication] of applications.entries()) {
+    try {
+      // The scheduler can resize an idle custom application while an image build
+      // is finishing. Re-read its configuration immediately before patching so
+      // an image rollout never writes the stale resources from the initial list.
+      // eslint-disable-next-line no-await-in-loop -- obtain the current configuration for this exact application.
+      const application = await findRunnerApplication(env, listedApplication.name, dependencies);
+      // eslint-disable-next-line no-await-in-loop -- a configuration rollout must be observed before the next application.
+      const rollouts = await listRollouts(env, application.id, dependencies);
+      if (rollouts.some((rollout) => rollout.status === "pending" || rollout.status === "progressing")) {
+        skippedApplications.push(application.name);
+        continue;
+      }
+      if (
+        !options.reissueMatchingImageRollouts &&
+        application.configuration.image === image &&
+        rollouts.some((rollout) => rollout.status === "completed" && rollout.target_configuration.image === image)
+      ) {
+        continue;
+      }
+      if (applicationHasLiveInstances(application)) {
+        skippedApplications.push(application.name);
+        continue;
+      }
+      if (application.configuration.image !== image) {
+        // eslint-disable-next-line no-await-in-loop -- preserve capacity by finishing one image patch before the next.
+        await patchApplicationImage(env, application, image, dependencies);
+      }
+      // A scheduler admission may have resized this custom application while
+      // the image-only PATCH was in flight. Read its current resources again so
+      // the full rollout target cannot restore that stale machine shape.
+      // eslint-disable-next-line no-await-in-loop -- this exact application owns its next rollout body.
+      const current = await findRunnerApplication(env, application.name, dependencies);
+      if (applicationHasLiveInstances(current)) {
+        skippedApplications.push(application.name);
+        continue;
+      }
+      // PATCH acceptance does not make the requested image visible in the
+      // application's active configuration until a rollout applies it. Build
+      // the rollout target from this freshly read configuration so concurrent
+      // scheduler-owned resource changes survive while the new image remains
+      // explicit below.
+      // If a prior PATCH made it through but its rollout call did not, the
+      // application already has this image here. Still create the rollout: a
+      // desired configuration alone does not prove live instances moved.
+      // eslint-disable-next-line no-await-in-loop -- each explicit rollout belongs to this application.
+      await createApplicationImageRollout(
+        env,
+        current,
+        image,
+        "Cloudflare GitHub Actions runner image update",
+        dependencies,
+      );
+      updatedApplications.push(application.name);
+    } finally {
+      // eslint-disable-next-line no-await-in-loop -- progress must correspond to the application that just finished inspection.
+      await reportProgress({ processedApplications: index + 1, totalApplications: applications.length });
     }
-    if (
-      !options.reissueMatchingImageRollouts &&
-      application.configuration.image === image &&
-      rollouts.some((rollout) => rollout.status === "completed" && rollout.target_configuration.image === image)
-    ) {
-      continue;
-    }
-    if (applicationHasLiveInstances(application)) {
-      skippedApplications.push(application.name);
-      continue;
-    }
-    if (application.configuration.image !== image) {
-      // eslint-disable-next-line no-await-in-loop -- preserve capacity by finishing one image patch before the next.
-      await patchApplicationImage(env, application, image, dependencies);
-    }
-    // A scheduler admission may have resized this custom application while
-    // the image-only PATCH was in flight. Read its current resources again so
-    // the full rollout target cannot restore that stale machine shape.
-    // eslint-disable-next-line no-await-in-loop -- this exact application owns its next rollout body.
-    const current = await findRunnerApplication(env, application.name, dependencies);
-    if (applicationHasLiveInstances(current)) {
-      skippedApplications.push(application.name);
-      continue;
-    }
-    // PATCH acceptance does not make the requested image visible in the
-    // application's active configuration until a rollout applies it. Build
-    // the rollout target from this freshly read configuration so concurrent
-    // scheduler-owned resource changes survive while the new image remains
-    // explicit below.
-    // If a prior PATCH made it through but its rollout call did not, the
-    // application already has this image here. Still create the rollout: a
-    // desired configuration alone does not prove live instances moved.
-    // eslint-disable-next-line no-await-in-loop -- each explicit rollout belongs to this application.
-    await createApplicationImageRollout(
-      env,
-      current,
-      image,
-      "Cloudflare GitHub Actions runner image update",
-      dependencies,
-    );
-    updatedApplications.push(application.name);
   }
   return { updatedApplications, skippedApplications };
 }

@@ -1,6 +1,6 @@
 {
   "name": "cloudflare-github-actions-runner",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "description": "Run GitHub Actions jobs as disposable Cloudflare Containers.",
   "keywords": [
     "ci",

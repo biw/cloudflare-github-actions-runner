@@ -13,6 +13,7 @@ import {
   runnerImageBuilderExitError,
   runnerImageBuilderExitStatusPath,
   runnerImageBuilderLogPath,
+  runnerImageBuilderProgressPath,
   runnerImageBuilderResultPath,
 } from "./runner-image-builder-command";
 import {
@@ -29,7 +30,7 @@ export interface RunnerImageBuildResult {
 }
 
 export type RunnerImageBuildStatus =
-  | { kind: "running" }
+  | { kind: "running"; phase?: RunnerImageBuildPhase }
   | { kind: "completed"; result: RunnerImageBuildResult }
   | { kind: "failed"; exitCode: number; diagnostic?: string };
 
@@ -64,10 +65,31 @@ export const runnerImageBuildPhases = [
 
 export type RunnerImageBuildPhase = (typeof runnerImageBuildPhases)[number];
 
+/** A joining Workflow may observe the owner's build, but must not overwrite its progress record. */
+export function runnerImageBuildPhaseForOwner(
+  ownsBuild: boolean,
+  status: RunnerImageBuildStatus,
+): RunnerImageBuildPhase | undefined {
+  return ownsBuild && status.kind === "running" ? status.phase : undefined;
+}
+
+/** Accept both the current prefixed status and the bare exit code used by older detached builders. */
+export function runnerImageBuilderPolledExitCode(status: string): number | undefined {
+  const value = status.startsWith("exited:") ? status.slice("exited:".length) : status;
+  return /^\d+$/u.test(value) ? runnerImageBuilderExitCode(Number(value)) : undefined;
+}
+
 export interface RunnerImageBuildProgress {
   workflowId: string;
   phase: RunnerImageBuildPhase;
+  rollout?: RunnerImageBuildRolloutProgress;
   updatedAt: string;
+}
+
+/** Real-time application counts are available only while rolling out a completed image. */
+export interface RunnerImageBuildRolloutProgress {
+  processedApplications: number;
+  totalApplications: number;
 }
 
 interface ActiveRunnerImageBuild {
@@ -195,8 +217,29 @@ export class RunnerImageBuilder extends Container<WorkerEnvironment> {
     return runnerImageBuilderProtocolVersion;
   }
 
-  async updateBuildProgress(workflowId: string, phase: RunnerImageBuildPhase): Promise<void> {
-    await this.ctx.storage.put(runnerImageBuildProgressKey, { workflowId, phase, updatedAt: new Date().toISOString() });
+  async updateBuildProgress(
+    workflowId: string,
+    phase: RunnerImageBuildPhase,
+    rollout?: RunnerImageBuildRolloutProgress,
+  ): Promise<void> {
+    const current = await this.ctx.storage.get<RunnerImageBuildProgress>(runnerImageBuildProgressKey);
+    if (
+      current?.workflowId === workflowId &&
+      current.phase === phase &&
+      current.rollout?.processedApplications === rollout?.processedApplications &&
+      current.rollout?.totalApplications === rollout?.totalApplications
+    ) {
+      return;
+    }
+    const next: RunnerImageBuildProgress = {
+      workflowId,
+      phase,
+      updatedAt: new Date().toISOString(),
+    };
+    if (rollout !== undefined) {
+      next.rollout = rollout;
+    }
+    await this.ctx.storage.put(runnerImageBuildProgressKey, next);
   }
 
   async buildProgress(workflowId: string): Promise<RunnerImageBuildProgress | undefined> {
@@ -417,6 +460,7 @@ export class RunnerImageBuilder extends Container<WorkerEnvironment> {
     });
 
     try {
+      await this.updateBuildProgress(workflowId, "downloading-source");
       const archive = await githubRepositoryArchiveWithMetadata(this.env, source.repository, source.ref);
       if (archive === undefined) {
         throw new Error("Cloudflare image builder could not download the configured source archive");
@@ -433,6 +477,7 @@ export class RunnerImageBuilder extends Container<WorkerEnvironment> {
         });
         throw new Error("Cloudflare image builder could not start its daemonless command host", { cause: error });
       }
+      await this.updateBuildProgress(workflowId, "preparing-build-context");
       const command = await container.exec(["/busybox/sh", "-c", runnerImageBuilderCommand()], {
         env: {
           RUNNER_IMAGE_SOURCE_URL: runnerImageSourceUrl,
@@ -451,7 +496,6 @@ export class RunnerImageBuilder extends Container<WorkerEnvironment> {
         }
         throw new Error(runnerImageBuilderExitError(runnerImageBuilderExitCode(output.exitCode)));
       }
-      await this.updateBuildProgress(workflowId, "building-and-pushing");
       return { owner: true };
     } catch (error) {
       const released = await this.releaseBuild(workflowId, sourceArchiveKey, true);
@@ -628,7 +672,7 @@ export class RunnerImageBuilder extends Container<WorkerEnvironment> {
           runnerImageBuilderBusyboxPath,
           "sh",
           "-c",
-          `if [ -f "${runnerImageBuilderExitStatusPath}" ]; then read exit_code < "${runnerImageBuilderExitStatusPath}"; printf "%s" "$exit_code"; else printf running; fi`,
+          `if [ -f "${runnerImageBuilderExitStatusPath}" ]; then read exit_code < "${runnerImageBuilderExitStatusPath}"; printf "exited:%s" "$exit_code"; elif [ -f "${runnerImageBuilderProgressPath}" ]; then read phase < "${runnerImageBuilderProgressPath}"; printf "phase:%s" "$phase"; else printf running; fi`,
         ],
         { stdout: "pipe", stderr: "ignore" },
       );
@@ -636,7 +680,17 @@ export class RunnerImageBuilder extends Container<WorkerEnvironment> {
       if (status === "running") {
         return { kind: "running" };
       }
-      exitCode = runnerImageBuilderExitCode(Number(status));
+      if (status.startsWith("phase:")) {
+        const phase = runnerImageBuildPhases.find((candidate) => candidate === status.slice("phase:".length));
+        return phase === "checking-image-cache" || phase === "building-and-pushing"
+          ? { kind: "running", phase }
+          : { kind: "running" };
+      }
+      const polledExitCode = runnerImageBuilderPolledExitCode(status);
+      if (polledExitCode === undefined) {
+        return { kind: "running" };
+      }
+      exitCode = polledExitCode;
     } catch (error) {
       console.error("Cloudflare image builder could not poll its detached build", {
         error: error instanceof Error ? error.message : String(error),

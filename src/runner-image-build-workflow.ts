@@ -23,6 +23,7 @@ import {
 import { runnerImageBuilderExitError } from "./runner-image-builder-command";
 import {
   runnerImageBuilderProtocolVersion,
+  runnerImageBuildPhaseForOwner,
   type RunnerImageBuildResult,
   type RunnerImageBuildStatus,
 } from "./runner-image-builder";
@@ -306,10 +307,6 @@ export class RunnerImageBuildWorkflow extends WorkflowEntrypoint<
       }
       let completed: RunnerImageBuildResult | undefined;
       for (let buildRound = 1; buildRound <= maximumBuildQueueRounds; buildRound += 1) {
-        // eslint-disable-next-line no-await-in-loop -- each queued source is staged only after its predecessor completes.
-        await withFreshRunnerImageBuilder(builderNamespace, (builder) =>
-          builder.updateBuildProgress(event.payload.workflowId, "downloading-source"),
-        );
         // A joining Workflow must wait for its predecessor, then stage its own source in a fresh slot.
         // eslint-disable-next-line no-await-in-loop -- the durable step serializes this exact queue position.
         ownsBuild = await step.do(`start runner image build in Cloudflare ${buildRound}`, buildStep, async () => {
@@ -340,6 +337,10 @@ export class RunnerImageBuildWorkflow extends WorkflowEntrypoint<
                 }
                 if (checked.kind === "failed") {
                   return { kind: "failed", exitCode: checked.exitCode, diagnostic: checked.diagnostic };
+                }
+                const phase = runnerImageBuildPhaseForOwner(ownsBuild, checked);
+                if (phase !== undefined) {
+                  await builder.updateBuildProgress(event.payload.workflowId, phase);
                 }
                 return { kind: "running" };
               }),
@@ -402,6 +403,8 @@ export class RunnerImageBuildWorkflow extends WorkflowEntrypoint<
               await builder.updateBuildProgress(event.payload.workflowId, "rolling-out");
               const result = await rolloutRunnerApplicationImages(this.env, completed.imageReference, undefined, {
                 reissueMatchingImageRollouts: lease.reissueMatchingImageRollouts,
+                onProgress: (progress) =>
+                  builder.updateBuildProgress(event.payload.workflowId, "rolling-out", progress),
               });
               await builder.completeRollOutAttempt(event.payload.workflowId, completed.imageReference);
               // Keep the lease while busy applications are pending. The next
