@@ -5,7 +5,9 @@ import {
   cloudflareWorkflowInstanceUrl,
   collapseCloudflareAccountCandidates,
   deploymentProgressFromOutput,
+  existingWorkerTokenStatusMessages,
   extractWorkerBaseUrl,
+  formatSetupStepDuration,
   generateResourceTraceSigningKey,
   generateWebhookSecret,
   githubAppCanServeRunnerOwner,
@@ -39,6 +41,7 @@ import {
   retryRemoteRunnerImageBuild,
   retryWorkerTokenValidation,
   runnerPoolSummary,
+  shouldCreateInitialGitHubApp,
   waitForRemoteRunnerImageBuild,
   waitForWorkerHealthCheck,
   waitForWorkerSetupAuthorization,
@@ -69,6 +72,12 @@ describe("interactive setup helpers", () => {
 
   it("generates a high-entropy runner resource-trace signing key", () => {
     expect(generateResourceTraceSigningKey()).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+  });
+
+  it("formats completed setup-step durations for terminal output", () => {
+    expect(formatSetupStepDuration(1)).toBe("1ms");
+    expect(formatSetupStepDuration(1_250)).toBe("1.3s");
+    expect(formatSetupStepDuration(61_900)).toBe("1m 1s");
   });
 
   it("validates setup-time R2 cache inputs", () => {
@@ -386,9 +395,17 @@ describe("interactive setup helpers", () => {
     expect(remoteRunnerImageBuildProgressMessage({ status: "queued" })).toBe(
       "Waiting for Cloudflare to schedule the image build",
     );
+    expect(remoteRunnerImageBuildProgressMessage({ progress: { phase: "bootstrapping-builder" } })).toBe(
+      "Bootstrapping Cloudflare's private daemonless image builder",
+    );
     expect(remoteRunnerImageBuildProgressMessage({ progress: { phase: "building-and-pushing" } })).toBe(
       "Building and pushing the runner image to Cloudflare's private registry",
     );
+    expect(
+      remoteRunnerImageBuildProgressMessage({
+        progress: { phase: "rolling-out", rollout: { processedApplications: 3, totalApplications: 6 } },
+      }),
+    ).toBe("Rolling runner profiles to the new image (3/6 profiles checked)");
     expect(
       remoteRunnerImageBuildFailure({
         status: "errored",
@@ -518,6 +535,33 @@ describe("interactive setup helpers", () => {
       runnerCacheSigningKey: true,
     });
     expect(() => parseRunnerSetupTokenStatus("{}")).toThrow(/incomplete token validation information/u);
+  });
+
+  it("keeps a discovered GitHub App configuration until the user explicitly replaces it", () => {
+    const unavailableApp = { githubApp: false, githubAppWebhookSecret: false };
+
+    expect(shouldCreateInitialGitHubApp(unavailableApp, true)).toBe(false);
+    expect(shouldCreateInitialGitHubApp(unavailableApp, false)).toBe(true);
+    expect(shouldCreateInitialGitHubApp({ githubApp: true, githubAppWebhookSecret: true }, false)).toBe(false);
+  });
+
+  it("summarizes existing Worker credentials without exposing their values", () => {
+    expect(
+      existingWorkerTokenStatusMessages({
+        cloudflareContainersToken: true,
+        cloudflareRegistryPush: true,
+        cloudflareResourceTagging: true,
+        githubApp: false,
+        githubAppWebhookSecret: true,
+        resourceTraceSigningKey: true,
+        runnerCacheSigningKey: false,
+      }),
+    ).toEqual([
+      "✔ Cloudflare Containers Write + Tag Read/Write token: valid (reusing)",
+      "✘ GitHub App credentials: unavailable or rejected",
+      "✔ Runner resource-trace signing key: present (reusing)",
+      "✘ Runner R2-cache signing key: missing",
+    ]);
   });
 
   it("retries temporary Worker validation authorization failures", async () => {

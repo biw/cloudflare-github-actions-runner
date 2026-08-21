@@ -5,7 +5,11 @@ import { describe, expect, it, vi } from "vite-plus/test";
 vi.mock("@cloudflare/containers", () => ({ Container: class {} }));
 
 import { runOneShotRunnerImageBuilder } from "../src/one-shot-runner-image-builder";
-import { RunnerImageBuilder } from "../src/runner-image-builder";
+import {
+  runnerImageBuilderPolledExitCode,
+  runnerImageBuildPhaseForOwner,
+  RunnerImageBuilder,
+} from "../src/runner-image-builder";
 import {
   runnerImageBuilderCommand,
   runnerImageBuilderEntrypoint,
@@ -180,6 +184,8 @@ describe("one-shot Cloudflare runner-image builder", () => {
 
     expect(runnerImageBuilderEntrypoint()).toEqual(["/busybox/sh", "-c", "exec sleep 2147483647"]);
     expect(script).toContain("/kaniko/executor --force");
+    expect(script).toContain('printf "%s" checking-image-cache > "$workspace/build.phase"');
+    expect(script).toContain('printf "%s" building-and-pushing > "$workspace/build.phase"');
     expect(script).toContain("--custom-platform linux/amd64");
     expect(script).toContain('--destination "$RUNNER_IMAGE_REFERENCE"');
     expect(script).toContain("--insecure-registry registry.cloudflare.com");
@@ -203,6 +209,29 @@ describe("one-shot Cloudflare runner-image builder", () => {
     expect(spawnSync("sh", ["-n"], { input: script }).status).toBe(0);
   });
 
+  it("reports the live image-build phase written by the detached command", async () => {
+    // SAFETY: This test supplies every field buildStatus reads and invokes no Container constructor behavior.
+    const builder = Object.assign(Object.create(RunnerImageBuilder.prototype), {
+      ctx: {
+        storage: {
+          get: async () => ({
+            workflowId: "workflow",
+            sourceArchiveKey: "runner-image-source/workflow.tar.gz",
+            state: "active",
+            leaseExpiresAt: Date.now() + 60_000,
+          }),
+        },
+        container: {
+          exec: async () => ({
+            output: async () => ({ stdout: new TextEncoder().encode("phase:building-and-pushing") }),
+          }),
+        },
+      },
+    }) as RunnerImageBuilder;
+
+    await expect(builder.buildStatus()).resolves.toEqual({ kind: "running", phase: "building-and-pushing" });
+  });
+
   it("turns known batch exit statuses into non-sensitive setup failures", () => {
     expect(runnerImageBuilderExitError(10)).toContain("download the configured GitHub source archive");
     expect(runnerImageBuilderExitError(13)).toContain("build and push the runner image");
@@ -211,6 +240,43 @@ describe("one-shot Cloudflare runner-image builder", () => {
     );
     expect(runnerImageBuilderExitCode(13)).toBe(13);
     expect(runnerImageBuilderExitCode(Number.NaN)).toBe(1);
+    expect(runnerImageBuilderPolledExitCode("exited:13")).toBe(13);
+    expect(runnerImageBuilderPolledExitCode("13")).toBe(13);
+    expect(runnerImageBuilderPolledExitCode("phase:building-and-pushing")).toBeUndefined();
+  });
+
+  it("publishes live build phases only from the Workflow that owns the build", () => {
+    const status = { kind: "running", phase: "building-and-pushing" } as const;
+
+    expect(runnerImageBuildPhaseForOwner(true, status)).toBe("building-and-pushing");
+    expect(runnerImageBuildPhaseForOwner(false, status)).toBeUndefined();
+  });
+
+  it("does not let a joining Workflow publish source-download progress", async () => {
+    const updateBuildProgress = vi.fn<(workflowId: string, phase: string) => Promise<void>>(async () => undefined);
+    // SAFETY: An active owner makes startBuild return before it uses any omitted Worker bindings or Container methods.
+    const builder = Object.assign(Object.create(RunnerImageBuilder.prototype), {
+      ctx: {
+        container: {},
+        storage: {
+          get: async () => ({
+            workflowId: "owner-workflow",
+            sourceArchiveKey: "runner-image-source/owner-workflow.tar.gz",
+            state: "active",
+            leaseExpiresAt: Date.now() + 60_000,
+          }),
+        },
+      },
+      env: { CLOUDFLARE_ACCOUNT_ID: "account", RUNNER_IMAGE_NAME: "runner" },
+      updateBuildProgress,
+    }) as RunnerImageBuilder;
+
+    await expect(
+      builder.startBuild("joining-workflow", { repository: { owner: "octo", repository: "runner" }, ref: "main" }),
+    ).resolves.toEqual({
+      owner: false,
+    });
+    expect(updateBuildProgress).not.toHaveBeenCalled();
   });
 
   it("stages an isolated context and reports each daemonless command-stage failure", () => {

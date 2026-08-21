@@ -11,6 +11,7 @@ export function runnerImageBuilderEntrypoint(): string[] {
 export const runnerImageBuilderWorkspace = "/tmp/cloudflare-runner-workspace";
 export const runnerImageBuilderExitStatusPath = `${runnerImageBuilderWorkspace}/build.exit`;
 export const runnerImageBuilderLogPath = `${runnerImageBuilderWorkspace}/build.log`;
+export const runnerImageBuilderProgressPath = `${runnerImageBuilderWorkspace}/build.phase`;
 export const runnerImageBuilderBusyboxPath = `${runnerImageBuilderWorkspace}/busybox`;
 export const runnerImageBuilderResultPath = `${runnerImageBuilderWorkspace}/build.result`;
 export const runnerImageBuilderBuiltPath = `${runnerImageBuilderWorkspace}/build.built`;
@@ -32,9 +33,11 @@ export function runnerImageBuilderCommand(): string {
   const command = kanikoCommand();
   const buildAction = [
     "build_runner_image() {",
+    'printf "%s" checking-image-cache > "$workspace/build.phase"',
     'if /busybox/wget -q --spider "$RUNNER_IMAGE_REGISTRY_MANIFEST_URL/runner-$source_digest"; then',
     '  printf "%s" false > "$workspace/build.built"',
     "else",
+    '  printf "%s" building-and-pushing > "$workspace/build.phase"',
     `  ${command} || return 13`,
     '  printf "%s" true > "$workspace/build.built"',
     "fi",

@@ -52,6 +52,19 @@ function colorStatus(color, status) {
   return `${terminalColor[color]}${status}${terminalColor.reset}`;
 }
 
+export function formatSetupStepDuration(durationMs) {
+  const roundedDurationMs = Math.max(0, Math.round(durationMs));
+  if (roundedDurationMs < 1_000) {
+    return `${roundedDurationMs}ms`;
+  }
+  if (roundedDurationMs < 60_000) {
+    return `${(roundedDurationMs / 1_000).toFixed(1)}s`;
+  }
+  const minutes = Math.floor(roundedDurationMs / 60_000);
+  const seconds = Math.floor((roundedDurationMs % 60_000) / 1_000);
+  return `${minutes}m ${seconds}s`;
+}
+
 async function withSpinner(checkingStatus, completeStatus, operation) {
   let frame = 0;
   let timer;
@@ -81,10 +94,21 @@ async function withSpinner(checkingStatus, completeStatus, operation) {
       render();
     }
   };
+  const runStep = async (status, completedStatus, step) => {
+    updateStatus(status);
+    const startedAt = Date.now();
+    const result = await step();
+    pause();
+    process.stdout.write(
+      `${colorStatus("green", `✔ ${completedStatus} (${formatSetupStepDuration(Date.now() - startedAt)})`)}\n`,
+    );
+    resume();
+    return result;
+  };
 
   resume();
   try {
-    const result = await operation({ pause, resume, updateStatus });
+    const result = await operation({ pause, resume, runStep, updateStatus });
     pause();
     const status = completeStatus instanceof Function ? completeStatus(result) : { message: completeStatus };
     process.stdout.write(`${colorStatus(status.color ?? "green", `${status.marker ?? "✔"} ${status.message}`)}\n`);
@@ -328,6 +352,24 @@ export function hasValidRunnerSetupTokenStatus(status) {
     status.resourceTraceSigningKey &&
     status.runnerCacheSigningKey
   );
+}
+
+/** Non-sensitive credential check results shown before setup changes any stored credentials. */
+export function existingWorkerTokenStatusMessages(status) {
+  const cloudflareTokenValid =
+    status.cloudflareContainersToken && status.cloudflareRegistryPush && status.cloudflareResourceTagging;
+  const githubAppValid = status.githubApp && status.githubAppWebhookSecret;
+  return [
+    `${cloudflareTokenValid ? "✔" : "✘"} Cloudflare Containers Write + Tag Read/Write token: ${cloudflareTokenValid ? "valid (reusing)" : "needs attention"}`,
+    `${githubAppValid ? "✔" : "✘"} GitHub App credentials: ${githubAppValid ? "valid (reusing)" : "unavailable or rejected"}`,
+    `${status.resourceTraceSigningKey ? "✔" : "✘"} Runner resource-trace signing key: ${status.resourceTraceSigningKey ? "present (reusing)" : "missing"}`,
+    `${status.runnerCacheSigningKey ? "✔" : "✘"} Runner R2-cache signing key: ${status.runnerCacheSigningKey ? "present (reusing)" : "missing"}`,
+  ];
+}
+
+/** Keep discoverable App credentials until the user explicitly chooses a replacement. */
+export function shouldCreateInitialGitHubApp(existingTokens, existingGitHubAppConfiguration) {
+  return !(existingTokens.githubApp && existingTokens.githubAppWebhookSecret) && !existingGitHubAppConfiguration;
 }
 
 export function githubAppManifest(name, workerBaseUrl, redirectUrl) {
@@ -1394,6 +1436,8 @@ export function remoteRunnerImageBuildProgressMessage(status) {
   const phase = status?.progress?.phase;
   const phases = {
     queued: "Waiting for Cloudflare to schedule the image build",
+    "bootstrapping-builder": "Bootstrapping Cloudflare's private daemonless image builder",
+    "rolling-out-builder": "Rolling Cloudflare's private daemonless image builder to its private image",
     "downloading-source": "Downloading the runner-image source from GitHub",
     "starting-builder": "Starting Cloudflare's isolated daemonless image builder",
     "preparing-build-context": "Preparing the runner image build context",
@@ -1403,7 +1447,19 @@ export function remoteRunnerImageBuildProgressMessage(status) {
   };
   const parsedPhase = z.enum(Object.keys(phases)).safeParse(phase);
   if (parsedPhase.success) {
-    return phases[parsedPhase.data];
+    const message = phases[parsedPhase.data];
+    if (parsedPhase.data !== "rolling-out") {
+      return message;
+    }
+    const rollout = z
+      .object({
+        processedApplications: z.number().int().nonnegative(),
+        totalApplications: z.number().int().nonnegative(),
+      })
+      .safeParse(status?.progress?.rollout);
+    return rollout.success
+      ? `${message} (${rollout.data.processedApplications}/${rollout.data.totalApplications} profiles checked)`
+      : message;
   }
   if (status?.status === "queued") {
     return phases.queued;
@@ -1793,51 +1849,79 @@ export async function main() {
     });
 
   const setupValidationToken = generateWebhookSecret();
+  const existingGitHubAppConfiguration = cloudflareAccount.runnerPool.githubAppConfigured;
   const existingTokens = await retryWorkerValidationAuthorization(() =>
-    withSpinner("Checking existing Worker token configuration", "Worker token configuration: checked", async () => {
-      await putWorkerSecret("CLOUDFLARE_ACCOUNT_ID", cloudflareAccount.account.id, cloudflareEnvironment);
-      await putWorkerSecret("RUNNER_SETUP_VALIDATION_TOKEN", setupValidationToken, cloudflareEnvironment);
-      return retryWorkerTokenValidation(() => validateExistingWorkerTokens(workerBaseUrl, setupValidationToken));
-    }),
+    withSpinner(
+      "Checking existing Worker token configuration",
+      "Worker token configuration: checked",
+      async ({ runStep }) => {
+        await runStep(
+          "Saving the selected Cloudflare account for the Worker",
+          "Selected Cloudflare account saved for the Worker",
+          () => putWorkerSecret("CLOUDFLARE_ACCOUNT_ID", cloudflareAccount.account.id, cloudflareEnvironment),
+        );
+        await runStep(
+          "Authorizing this setup session with the Worker",
+          "Setup session authorized with the Worker",
+          () => putWorkerSecret("RUNNER_SETUP_VALIDATION_TOKEN", setupValidationToken, cloudflareEnvironment),
+        );
+        return runStep(
+          "Validating the Worker's existing Cloudflare and GitHub App credentials",
+          "Existing Worker credentials validated",
+          () =>
+            retryWorkerTokenValidation(() => validateExistingWorkerTokens(workerBaseUrl, setupValidationToken), {
+              // An existing App can take a short time to become visible after the
+              // deployment that introduced this setup session. Do not create a
+              // duplicate App merely because GitHub has not accepted its JWT yet.
+              isValid: existingGitHubAppConfiguration
+                ? (status) => status.githubApp && status.githubAppWebhookSecret
+                : () => true,
+            }),
+        );
+      },
+    ),
   );
   if (existingTokens === undefined) {
     await deleteWorkerSecret("RUNNER_SETUP_VALIDATION_TOKEN", cloudflareEnvironment);
     console.log("Setup stopped. The temporary setup credential was removed.");
     return;
   }
+  console.log("\nExisting Worker credential status:");
+  for (const message of existingWorkerTokenStatusMessages(existingTokens)) {
+    console.log(`  ${message}`);
+  }
 
   let discardUninstalledInitialGitHubAppCredentials = false;
   try {
     let cloudflareToken;
-    if (
+    const existingCloudflareTokenIsValid =
       existingTokens.cloudflareContainersToken &&
       existingTokens.cloudflareRegistryPush &&
-      existingTokens.cloudflareResourceTagging
-    ) {
-      console.log("  \u2714 Reusing the valid account-owned Cloudflare Containers Write + Tag Read/Write token");
-    } else {
+      existingTokens.cloudflareResourceTagging;
+    if (!existingCloudflareTokenIsValid) {
       cloudflareToken = await promptForValidatedCloudflareToken(cloudflareAccount.account, { showTokenForm: true });
       await putWorkerSecret("CLOUDFLARE_CONTAINERS_API_TOKEN", cloudflareToken, cloudflareEnvironment);
     }
 
     let createdGitHubApp;
     let replacementGitHubAppIsPending = false;
-    if (existingTokens.githubApp && existingTokens.githubAppWebhookSecret) {
-      console.log("  \u2714 Reusing the valid GitHub App credentials");
-    } else {
-      createdGitHubApp = await createGitHubApp();
-      await storeGitHubAppCredentials(createdGitHubApp, cloudflareEnvironment);
-      discardUninstalledInitialGitHubAppCredentials = true;
+    const existingGitHubAppIsValid = existingTokens.githubApp && existingTokens.githubAppWebhookSecret;
+    if (!existingGitHubAppIsValid) {
+      if (!shouldCreateInitialGitHubApp(existingTokens, existingGitHubAppConfiguration)) {
+        console.log(
+          "  ! Found an existing GitHub App configuration, but GitHub did not validate it. Keeping it until you choose recovery.",
+        );
+      } else {
+        createdGitHubApp = await createGitHubApp();
+        await storeGitHubAppCredentials(createdGitHubApp, cloudflareEnvironment);
+        discardUninstalledInitialGitHubAppCredentials = true;
+      }
     }
 
-    if (existingTokens.resourceTraceSigningKey) {
-      console.log("  ✔ Reusing the runner resource-trace signing key");
-    } else {
+    if (!existingTokens.resourceTraceSigningKey) {
       await putWorkerSecret("RESOURCE_TRACE_SIGNING_KEY", generateResourceTraceSigningKey(), cloudflareEnvironment);
     }
-    if (existingTokens.runnerCacheSigningKey) {
-      console.log("  ✔ Reusing the runner R2-cache signing key");
-    } else {
+    if (!existingTokens.runnerCacheSigningKey) {
       await putWorkerSecret("RUNNER_CACHE_SIGNING_KEY", generateResourceTraceSigningKey(), cloudflareEnvironment);
     }
 

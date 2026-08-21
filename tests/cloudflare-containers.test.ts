@@ -349,9 +349,12 @@ describe("Cloudflare custom Container configuration", () => {
       response([idle]),
       response(rollout("completed", resources)),
     );
+    const progress = vi.fn<(status: { processedApplications: number; totalApplications: number }) => Promise<void>>(
+      async () => undefined,
+    );
 
     await expect(
-      rolloutRunnerApplicationImages(env, "registry.cloudflare.com/account/runner:new", deps),
+      rolloutRunnerApplicationImages(env, "registry.cloudflare.com/account/runner:new", deps, { onProgress: progress }),
     ).resolves.toEqual({
       updatedApplications: ["runner-standard-3"],
       skippedApplications: [],
@@ -367,6 +370,39 @@ describe("Cloudflare custom Container configuration", () => {
     expect(JSON.parse(String(deps.fetch.mock.calls[5]?.[1]?.body))).toMatchObject({
       target_configuration: { image: "registry.cloudflare.com/account/runner:new" },
     });
+    expect(progress).toHaveBeenNthCalledWith(1, { processedApplications: 0, totalApplications: 1 });
+    expect(progress).toHaveBeenNthCalledWith(2, { processedApplications: 1, totalApplications: 1 });
+  });
+
+  it("does not fail an image rollout when setup progress reporting is unavailable", async () => {
+    const idle = {
+      ...application(resources, "runner-standard-3"),
+      health: { instances: { active: 0, assigned: 0, starting: 0, scheduling: 0 } },
+    };
+    const deps = dependencies(
+      response([idle]),
+      response([idle]),
+      response([]),
+      response(idle),
+      response([idle]),
+      response(rollout("completed", resources)),
+    );
+    const progress = vi.fn<() => Promise<void>>(async () => {
+      throw new Error("Durable Object temporarily unavailable");
+    });
+    const progressError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await expect(
+      rolloutRunnerApplicationImages(env, "registry.cloudflare.com/account/runner:new", deps, { onProgress: progress }),
+    ).resolves.toEqual({
+      updatedApplications: ["runner-standard-3"],
+      skippedApplications: [],
+    });
+    expect(progress).toHaveBeenCalledTimes(2);
+    expect(progressError).toHaveBeenCalledWith("Cloudflare runner image rollout progress reporting failed", {
+      error: "Durable Object temporarily unavailable",
+    });
+    progressError.mockRestore();
   });
 
   it("uses the current custom-machine resources rather than the stale application list during an image rollout", async () => {
