@@ -67,7 +67,7 @@ describe("runner cache assignment hook", () => {
   }, 10_000);
 
   it("fails closed on an unexpected Worker status and never prints the runner capability", async () => {
-    const server = createServer((_request, response) => response.writeHead(401).end());
+    const server = createServer((_request, response) => response.writeHead(403).end());
     const port = await listen(server);
     const directory = await mkdtemp(join(tmpdir(), "runner-job-hook-test-"));
     const configurationPath = join(directory, "cache-assignment");
@@ -78,7 +78,7 @@ describe("runner cache assignment hook", () => {
       await expect(runHook(configurationPath)).resolves.toEqual({
         code: 1,
         stdout:
-          "::error title=Cloudflare runner cache assignment::The Worker returned HTTP 401 while waiting for GitHub's runner assignment.\n",
+          "::error title=Cloudflare runner cache assignment::The Worker returned HTTP 403 while waiting for GitHub's runner assignment.\n",
         stderr: "",
       });
       await expect(readFile(configurationPath)).rejects.toMatchObject({ code: "ENOENT" });
@@ -110,10 +110,68 @@ describe("runner cache assignment hook", () => {
       ).resolves.toEqual({
         code: 1,
         stdout:
-          "::error title=Cloudflare runner cache assignment::GitHub's runner assignment was not observed within 2 seconds.\n",
+          "::error title=Cloudflare runner cache assignment::GitHub's runner assignment was not observed within 2 seconds (last Worker status: 202).\n",
         stderr: "",
       });
       expect(attempts).toBe(2);
+      await expect(readFile(configurationPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await close(server);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps polling when the assignment authorization is not yet visible", async () => {
+    // The Worker writes the assignment record and the container reads it back
+    // through Cloudflare's edge, so the first samples can 401 before the
+    // authorization propagates. That is a race, not a verdict.
+    let attempts = 0;
+    const server = createServer((_request, response) => {
+      attempts += 1;
+      response.writeHead(attempts < 3 ? 401 : 200).end();
+    });
+    const port = await listen(server);
+    const directory = await mkdtemp(join(tmpdir(), "runner-job-hook-test-"));
+    const configurationPath = join(directory, "cache-assignment");
+    await writeFile(configurationPath, `http://127.0.0.1:${port}/v1/runner-cache\nBearer runner-capability\n`, {
+      mode: 0o600,
+    });
+
+    try {
+      await expect(
+        runHook(configurationPath, {
+          CF_RUNNER_CACHE_ASSIGNMENT_MAX_ATTEMPTS: "5",
+          CF_RUNNER_CACHE_ASSIGNMENT_POLL_SECONDS: "0",
+        }),
+      ).resolves.toEqual({ code: 0, stdout: "", stderr: "" });
+      expect(attempts).toBe(3);
+      await expect(readFile(configurationPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await close(server);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("still fails closed when the authorization never becomes visible", async () => {
+    const server = createServer((_request, response) => response.writeHead(401).end());
+    const port = await listen(server);
+    const directory = await mkdtemp(join(tmpdir(), "runner-job-hook-test-"));
+    const configurationPath = join(directory, "cache-assignment");
+    const capability = "Bearer capability-that-must-not-leak";
+    await writeFile(configurationPath, `http://127.0.0.1:${port}/v1/runner-cache\n${capability}\n`, { mode: 0o600 });
+
+    try {
+      const result = await runHook(configurationPath, {
+        CF_RUNNER_CACHE_ASSIGNMENT_MAX_ATTEMPTS: "2",
+        CF_RUNNER_CACHE_ASSIGNMENT_POLL_SECONDS: "0",
+      });
+      expect(result).toEqual({
+        code: 1,
+        stdout:
+          "::error title=Cloudflare runner cache assignment::GitHub's runner assignment was not observed within 2 seconds (last Worker status: 401).\n",
+        stderr: "",
+      });
+      expect(result.stdout).not.toContain(capability);
       await expect(readFile(configurationPath)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       await close(server);
