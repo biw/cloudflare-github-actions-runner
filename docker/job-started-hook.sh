@@ -43,13 +43,24 @@ while [ "$attempt" -le "$assignment_max_attempts" ]; do
   if [ "$status" = '200' ]; then
     exit 0
   fi
-  if [ "$status" != '202' ]; then
-    printf '%s\n' "::error title=Cloudflare runner cache assignment::The Worker returned HTTP $status while waiting for GitHub's runner assignment."
-    exit 1
-  fi
+  case "$status" in
+    202) ;;
+    # Transient conditions, not verdicts. The assignment record is written by
+    # the Worker and read back through Cloudflare's edge, so a container can
+    # poll before its authorization is visible and see 401. 000 is curl's
+    # output for a connection failure. Keep polling inside the existing
+    # bounded window instead of failing the job on the first sample.
+    000|401|408|429|500|502|503|504) ;;
+    *)
+      printf '%s\n' "::error title=Cloudflare runner cache assignment::The Worker returned HTTP $status while waiting for GitHub's runner assignment."
+      exit 1
+      ;;
+  esac
   attempt=$((attempt + 1))
   sleep "$assignment_poll_seconds"
 done
 
-printf '%s\n' "::error title=Cloudflare runner cache assignment::GitHub's runner assignment was not observed within ${assignment_max_attempts} seconds."
+# Still fail closed. The job must not run with a cache capability whose
+# assignment the Worker never confirmed.
+printf '%s\n' "::error title=Cloudflare runner cache assignment::GitHub's runner assignment was not observed within ${assignment_max_attempts} seconds (last Worker status: ${status})."
 exit 1
