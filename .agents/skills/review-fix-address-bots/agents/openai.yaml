@@ -1,4 +1,0 @@
-interface:
-  display_name: "Review, Fix, and Address Bots"
-  short_description: "Review and fix with configurable model reviewers"
-  default_prompt: "Use $review-fix-address-bots to integrate the PR base, run the requested persistent read-only reviewer cohort, resolve findings, validate and push, then close the review-bot loop."

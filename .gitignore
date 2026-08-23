@@ -5,4 +5,6 @@ dist/
 .dev.vars*
 .env*
 coverage/
+.agents/skills/
+.claude/skills/
 .conductor/*.log
