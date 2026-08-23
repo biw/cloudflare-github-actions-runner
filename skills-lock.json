@@ -11,13 +11,13 @@
       "source": "dmmulroy/anti-slop",
       "sourceType": "github",
       "skillPath": "skills/install-anti-slop/SKILL.md",
-      "computedHash": "8c03582ef9b14d0034d6a21da154449f7b9e6618900fb19886008982b3453f90"
+      "computedHash": "b903a7ac2c823d473a4b0046834fccbab0bc75ee4fda8be4f81efa895d475b01"
     },
     "review-fix-address-bots": {
       "source": "biw/skills",
       "sourceType": "github",
       "skillPath": "skills/review-fix-address-bots/SKILL.md",
-      "computedHash": "47c01eb738ad570ee9269f8c60590a1d1c2f7e394df3b763d4979c13da045986"
+      "computedHash": "44f5a087d34e444abf84a783f0a6e84ffc6be6b471c10149a7750e6416495a19"
     }
   }
 }
