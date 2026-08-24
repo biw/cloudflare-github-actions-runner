@@ -152,6 +152,97 @@ describe("runner cache assignment hook", () => {
     }
   });
 
+  it("keeps polling through a transient Cloudflare edge failure", async () => {
+    let attempts = 0;
+    const server = createServer((_request, response) => {
+      attempts += 1;
+      response.writeHead(attempts === 1 ? 522 : 200).end();
+    });
+    const port = await listen(server);
+    const directory = await mkdtemp(join(tmpdir(), "runner-job-hook-test-"));
+    const configurationPath = join(directory, "cache-assignment");
+    await writeFile(configurationPath, `http://127.0.0.1:${port}/v1/runner-cache\nBearer runner-capability\n`, {
+      mode: 0o600,
+    });
+
+    try {
+      await expect(
+        runHook(configurationPath, {
+          CF_RUNNER_CACHE_ASSIGNMENT_MAX_ATTEMPTS: "3",
+          CF_RUNNER_CACHE_ASSIGNMENT_POLL_SECONDS: "0",
+        }),
+      ).resolves.toEqual({ code: 0, stdout: "", stderr: "" });
+      expect(attempts).toBe(2);
+      await expect(readFile(configurationPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await close(server);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("bounds a hanging connection by the configured wait window", async () => {
+    let attempts = 0;
+    const server = createServer(() => {
+      attempts += 1;
+    });
+    const port = await listen(server);
+    const directory = await mkdtemp(join(tmpdir(), "runner-job-hook-test-"));
+    const configurationPath = join(directory, "cache-assignment");
+    await writeFile(configurationPath, `http://127.0.0.1:${port}/v1/runner-cache\nBearer runner-capability\n`, {
+      mode: 0o600,
+    });
+
+    try {
+      const startedAt = Date.now();
+      await expect(
+        runHook(configurationPath, {
+          CF_RUNNER_CACHE_ASSIGNMENT_MAX_ATTEMPTS: "1",
+          CF_RUNNER_CACHE_ASSIGNMENT_POLL_SECONDS: "0",
+        }),
+      ).resolves.toEqual({
+        code: 1,
+        stdout:
+          "::error title=Cloudflare runner cache assignment::GitHub's runner assignment was not observed within 1 seconds (last Worker status: 000).\n",
+        stderr: "",
+      });
+      expect(Date.now() - startedAt).toBeLessThan(3_000);
+      expect(attempts).toBe(1);
+      await expect(readFile(configurationPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      server.closeAllConnections();
+      await close(server);
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 10_000);
+
+  it("normalizes a leading-zero attempt count before deadline arithmetic", async () => {
+    let attempts = 0;
+    const server = createServer((_request, response) => {
+      attempts += 1;
+      response.writeHead(200).end();
+    });
+    const port = await listen(server);
+    const directory = await mkdtemp(join(tmpdir(), "runner-job-hook-test-"));
+    const configurationPath = join(directory, "cache-assignment");
+    await writeFile(configurationPath, `http://127.0.0.1:${port}/v1/runner-cache\nBearer runner-capability\n`, {
+      mode: 0o600,
+    });
+
+    try {
+      await expect(
+        runHook(configurationPath, {
+          CF_RUNNER_CACHE_ASSIGNMENT_MAX_ATTEMPTS: "08",
+          CF_RUNNER_CACHE_ASSIGNMENT_POLL_SECONDS: "0",
+        }),
+      ).resolves.toEqual({ code: 0, stdout: "", stderr: "" });
+      expect(attempts).toBe(1);
+      await expect(readFile(configurationPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await close(server);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("still fails closed when the authorization never becomes visible", async () => {
     const server = createServer((_request, response) => response.writeHead(401).end());
     const port = await listen(server);
