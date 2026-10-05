@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   check-version:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       version: ${{ steps.check.outputs.version }}
       should_publish: ${{ steps.check.outputs.should_publish }}
@@ -48,7 +48,7 @@ jobs:
         if: steps.revision.outputs.is_current == 'true'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: "24"
+          node-version: "26"
 
       - name: Check if version should be published
         if: steps.revision.outputs.is_current == 'true'
@@ -84,7 +84,7 @@ jobs:
   publish:
     needs: check-version
     if: needs.check-version.outputs.should_publish == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       id-token: write
@@ -98,12 +98,12 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: "24"
+          node-version: "26"
           registry-url: "https://registry.npmjs.org"
           package-manager-cache: false
 
-      - name: Enable pnpm
-        run: corepack enable
+      - name: Setup pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
       - name: Verify package
@@ -143,7 +143,7 @@ jobs:
       needs.check-version.result == 'success' &&
       needs.check-version.outputs.should_publish == 'true' &&
       needs.publish.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
 
