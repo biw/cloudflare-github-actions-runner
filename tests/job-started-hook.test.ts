@@ -43,6 +43,31 @@ async function runHook(configurationPath: string | undefined, environment: Recor
 }
 
 describe("runner cache assignment hook", () => {
+  it("includes the executing workflow run when polling for an assignment", async () => {
+    const requests: string[] = [];
+    const server = createServer((request, response) => {
+      requests.push(request.url ?? "");
+      response.writeHead(200).end();
+    });
+    const port = await listen(server);
+    const directory = await mkdtemp(join(tmpdir(), "runner-job-hook-test-"));
+    const configurationPath = join(directory, "cache-assignment");
+    await writeFile(configurationPath, `http://127.0.0.1:${port}/v1/runner-cache\nBearer runner-capability\n`, {
+      mode: 0o600,
+    });
+    try {
+      await expect(runHook(configurationPath, { GITHUB_RUN_ID: "12345" })).resolves.toEqual({
+        code: 0,
+        stdout: "",
+        stderr: "",
+      });
+      expect(requests).toEqual(["/v1/runner-cache-v2/assignment?run_id=12345"]);
+    } finally {
+      await close(server);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("waits for the GitHub assignment webhook before a cache-enabled job begins", async () => {
     let attempts = 0;
     const server = createServer((_request, response) => {

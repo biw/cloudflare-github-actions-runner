@@ -101,7 +101,11 @@ export interface RunnerCacheWriteAuthorizer {
    * JIT runners are eligible for any compatible queued job, so the job that
    * caused a runner to be provisioned is not necessarily the one it executes.
    */
-  cacheAssignment?(runnerName: string, repository: string): Promise<AssignedRunnerCacheScope | undefined>;
+  cacheAssignment?(
+    runnerName: string,
+    repository: string,
+    runId?: string,
+  ): Promise<AssignedRunnerCacheScope | undefined>;
   cacheScope?(runnerName: string, repository: string, jobId: string): Promise<RunnerCacheScope | undefined>;
   /** @deprecated Kept temporarily for direct handler consumers upgrading to scoped access. */
   canWriteCache?(runnerName: string, repository: string): Promise<boolean>;
@@ -455,11 +459,14 @@ interface ResolvedRunnerCacheClaim {
 async function resolveRunnerCacheClaim(
   writeAuthorizer: RunnerCacheWriteAuthorizer,
   claim: RunnerCacheClaim,
+  runId?: string,
 ): Promise<ResolvedRunnerCacheClaim | undefined> {
   const assignment =
     writeAuthorizer.cacheAssignment === undefined
       ? undefined
-      : await writeAuthorizer.cacheAssignment(claim.runnerName, claim.repository);
+      : runId === undefined
+        ? await writeAuthorizer.cacheAssignment(claim.runnerName, claim.repository)
+        : await writeAuthorizer.cacheAssignment(claim.runnerName, claim.repository, runId);
   if (
     assignment !== undefined &&
     validRunnerCacheScope(assignment.cacheScope.scope) &&
@@ -996,7 +1003,14 @@ export async function handleRunnerCacheV2Request(
   if (claim === undefined) {
     return json({ error: "Unauthorized" }, 401);
   }
-  const resolved = await resolveRunnerCacheClaim(writeAuthorizer, claim);
+  const runId =
+    request.method === "GET" && url.pathname === "/v1/runner-cache-v2/assignment"
+      ? (url.searchParams.get("run_id") ?? undefined)
+      : undefined;
+  if (runId !== undefined && !/^[1-9][0-9]*$/u.test(runId)) {
+    return json({ error: "Invalid workflow run ID" }, 400);
+  }
+  const resolved = await resolveRunnerCacheClaim(writeAuthorizer, claim, runId);
   // GitHub can start a JIT runner a moment before its authoritative
   // `workflow_job: in_progress` webhook reaches this Worker. The runner's
   // pre-job hook polls this endpoint, so actions/cache never observes that

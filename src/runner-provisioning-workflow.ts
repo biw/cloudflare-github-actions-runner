@@ -18,6 +18,7 @@ import { runnerContainerFor } from "./runner-container-router";
 
 export interface RunnerProvisioningWorkflowParameters {
   jobId: string;
+  runnerName?: string;
 }
 
 const apiStepConfig = {
@@ -141,7 +142,7 @@ export async function startRunnerProvisioningWorkflows(
       // eslint-disable-next-line no-await-in-loop -- duplicate IDs are handled before the next job is scheduled.
       await env.RUNNER_PROVISIONING_WORKFLOW.create({
         id: admission.workflowId,
-        params: { jobId: admission.jobId },
+        params: { jobId: admission.jobId, runnerName: admission.runnerName },
         retention: { successRetention: "1 day", errorRetention: "7 days" },
       });
     } catch {
@@ -168,7 +169,7 @@ export class RunnerProvisioningWorkflow extends WorkflowEntrypoint<
     let plan: RunnerProvisioningPlan | undefined;
     for (let attempt = 1; attempt <= 120; attempt += 1) {
       // eslint-disable-next-line no-await-in-loop -- a custom slot may be configuring for an earlier job.
-      const claim = await scheduler.claimProvisioning(event.payload.jobId);
+      const claim = await scheduler.claimProvisioning(event.payload.jobId, event.payload.runnerName);
       if (claim.kind === "provision") {
         plan = claim;
         break;
@@ -203,7 +204,7 @@ export class RunnerProvisioningWorkflow extends WorkflowEntrypoint<
         await startRunnerProvisioningWorkflows(this.env, [...configuredAdmissions, ...capacityAdmissions]);
       }
 
-      const mayStart = await scheduler.canStart(plan.jobId);
+      const mayStart = await scheduler.canStart(plan.jobId, plan.runnerName);
       if (!mayStart) {
         const released = await scheduler.provisioningFailed(
           plan.jobId,
