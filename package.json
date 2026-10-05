@@ -47,7 +47,7 @@
     "deploy:dry-run": "vp exec tsx scripts/deploy.ts --dry-run",
     "resource-traces": "vp exec tsx scripts/resource-metrics.ts",
     "cf-typegen": "vp exec wrangler types",
-    "prepare": "pnpx skills experimental_install",
+    "prepare": "node scripts/prepare.mjs",
     "prepack": "vp pack",
     "prepublishOnly": "vp check && vp test"
   },
