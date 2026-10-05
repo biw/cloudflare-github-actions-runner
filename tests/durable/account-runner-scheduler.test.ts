@@ -136,7 +136,10 @@ describe("AccountRunnerScheduler JIT cache assignments", () => {
     // in_progress webhook never reached the Worker. The claim must still
     // resolve through the GitHub API self-heal instead of timing the job out.
     await runInDurableObject(scheduler, async (instance) => {
-      instance.runnerJobsOverride = async () => [{ id: 600, status: "in_progress" }];
+      instance.jobDetailOverride = async (jobId) =>
+        jobId === reassignedJob.jobId
+          ? { status: "in_progress", runner_id: 5_001, runner_name: queuedJob.runnerName }
+          : { status: "queued", runner_id: null, runner_name: null };
     });
 
     await expect(scheduler.cacheAssignment(queuedJob.runnerName, "biw/runner-poc")).resolves.toEqual({
@@ -157,7 +160,11 @@ describe("AccountRunnerScheduler JIT cache assignments", () => {
     await provisionRunner(scheduler, queuedJob.jobId, queuedJob.runnerName, 7_001);
 
     await runInDurableObject(scheduler, async (instance) => {
-      instance.runnerJobsOverride = async () => [{ id: 800, status: "completed" }];
+      instance.jobDetailOverride = async () => ({
+        status: "completed",
+        runner_id: null,
+        runner_name: null,
+      });
     });
 
     await expect(scheduler.cacheAssignment(queuedJob.runnerName, "biw/runner-poc")).resolves.toBeUndefined();
