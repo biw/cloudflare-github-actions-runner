@@ -1,0 +1,7 @@
+# CI, publishing, dependencies, and runner image changes need maintainer review.
+/.github/ @biw
+/docker/ @biw
+/scripts/prepare.mjs @biw
+/package.json @biw
+/pnpm-lock.yaml @biw
+/skills-lock.json @biw
