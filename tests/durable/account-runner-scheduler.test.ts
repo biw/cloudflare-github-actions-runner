@@ -123,6 +123,46 @@ describe("AccountRunnerScheduler JIT cache assignments", () => {
     await expect(scheduler.cacheAssignment(queuedJob.runnerName, "biw/runner-poc")).resolves.toBeUndefined();
   });
 
+  it("recovers a lost in_progress delivery by asking GitHub which job the runner executes", async () => {
+    const scheduler = env.RUNNER_SCHEDULER.getByName("github-reconcile");
+    const queuedJob = job("500", "cf-standard-3-job-500", "refs/pull/500/merge");
+    const reassignedJob = job("600", "cf-standard-3-job-600", "refs/pull/600/merge");
+
+    await scheduler.submit(queuedJob);
+    await scheduler.submit(reassignedJob);
+    await provisionRunner(scheduler, queuedJob.jobId, queuedJob.runnerName, 5_001);
+
+    // GitHub assigned the provisioned runner to a different job and its
+    // in_progress webhook never reached the Worker. The claim must still
+    // resolve through the GitHub API self-heal instead of timing the job out.
+    await runInDurableObject(scheduler, async (instance) => {
+      instance.runnerJobsOverride = async () => [{ id: 600, status: "in_progress" }];
+    });
+
+    await expect(scheduler.cacheAssignment(queuedJob.runnerName, "biw/runner-poc")).resolves.toEqual({
+      jobId: reassignedJob.jobId,
+      cacheScope: {
+        scope: reassignedJob.cacheScope?.scope,
+        fallbackScope: "refs/heads/main",
+        writeAllowed: true,
+      },
+    });
+  });
+
+  it("does not resolve an assignment when GitHub reports no in_progress job on the runner", async () => {
+    const scheduler = env.RUNNER_SCHEDULER.getByName("github-reconcile-empty");
+    const queuedJob = job("700", "cf-standard-3-job-700", "refs/pull/700/merge");
+
+    await scheduler.submit(queuedJob);
+    await provisionRunner(scheduler, queuedJob.jobId, queuedJob.runnerName, 7_001);
+
+    await runInDurableObject(scheduler, async (instance) => {
+      instance.runnerJobsOverride = async () => [{ id: 800, status: "completed" }];
+    });
+
+    await expect(scheduler.cacheAssignment(queuedJob.runnerName, "biw/runner-poc")).resolves.toBeUndefined();
+  });
+
   it("does not record an assignment across repository or machine-profile boundaries", async () => {
     const scheduler = env.RUNNER_SCHEDULER.getByName("isolated-assignment");
     const queuedJob = job("400", "cf-standard-3-job-400", "refs/pull/400/merge");
