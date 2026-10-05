@@ -8,12 +8,12 @@ permissions:
 
 jobs:
   check-version:
-    uses: biw/npm-trusted-publish-workflows/.github/workflows/check.yml@f2717133c7bf3a13ccc5eb1d35a4f41bd24074fb # main
+    uses: biw/npm-trusted-publish-workflows/.github/workflows/check.yml@v1
 
   publish:
     needs: check-version
     if: needs.check-version.outputs.should_publish == 'true'
-    uses: biw/npm-trusted-publish-workflows/.github/workflows/publish.yml@f2717133c7bf3a13ccc5eb1d35a4f41bd24074fb # main
+    uses: biw/npm-trusted-publish-workflows/.github/workflows/publish.yml@v1
     with:
       tested-sha: ${{ github.sha }}
     permissions:
