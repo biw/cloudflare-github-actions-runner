@@ -1740,7 +1740,17 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
 
   async provisioningFailed(jobId: string, reason: string): Promise<SchedulerResult> {
     const job = this.job(jobId);
-    if (job === undefined || !activeJobStates.has(job.status)) {
+    // Only a job actively being provisioned may be failed by its workflow.
+    // A stale or retried workflow must never tear down a job that already
+    // moved on — e.g. adopted onto a different JIT runner after a GitHub
+    // cross-assignment and now `running`.
+    if (job === undefined || job.status !== "provisioning") {
+      if (job !== undefined && activeJobStates.has(job.status)) {
+        this.recordEvent("provisioning-failed-ignored", {
+          jobId,
+          detail: { status: job.status, reason },
+        });
+      }
       return { accepted: false, admissions: [] };
     }
     this.releaseJob(job, "failed", reason);

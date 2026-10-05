@@ -221,6 +221,20 @@ describe("AccountRunnerScheduler JIT cache assignments", () => {
       expect(adopted.status).toBe("running");
       expect(adopted.runner_name).toBe(jobB.runnerName);
     });
+
+    // A late provisioning workflow for job A's abandoned `RA-r1` runner must
+    // not tear the adopted job down: provisioningFailed only applies to jobs
+    // still in `provisioning`.
+    await scheduler.provisioningFailed(jobA.jobId, "stale workflow");
+
+    await runInDurableObject(scheduler, async (_instance, state) => {
+      // SAFETY: the query selects exactly these two columns and every row carries them.
+      const surviving = state.storage.sql
+        .exec(`SELECT status, runner_name FROM scheduler_jobs WHERE job_id = ?`, jobA.jobId)
+        .toArray()[0] as { status: string; runner_name: string };
+      expect(surviving.status).toBe("running");
+      expect(surviving.runner_name).toBe(jobB.runnerName);
+    });
   });
 
   it("reconciles a running job whose in_progress webhook was lost", async () => {
