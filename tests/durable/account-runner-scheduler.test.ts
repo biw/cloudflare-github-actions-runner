@@ -150,9 +150,80 @@ describe("AccountRunnerScheduler JIT cache assignments", () => {
         writeAllowed: true,
       },
     });
+
+    // The ownership transfer must run through the same path as the webhook:
+    // the displaced job is requeued under a fresh retry runner name and the
+    // actual job takes over the runner reservation.
+    await runInDurableObject(scheduler, async (_instance, state) => {
+      // SAFETY: the query selects exactly these two columns and every row carries them.
+      const displaced = state.storage.sql
+        .exec(`SELECT status, runner_name FROM scheduler_jobs WHERE job_id = ?`, queuedJob.jobId)
+        .toArray()[0] as { status: string; runner_name: string };
+      expect(["queued", "admitted", "provisioning"]).toContain(displaced.status);
+      // The displaced job is requeued under a fresh `-rN` runner name (the
+      // provisioning workflow may fail in the test environment and retry).
+      expect(displaced.runner_name).toMatch(/cf-standard-3-job-500-r\d+/u);
+      // SAFETY: the query selects exactly these three columns and every row carries them.
+      const actual = state.storage.sql
+        .exec(
+          `SELECT status, runner_name, github_assignment_observed FROM scheduler_jobs WHERE job_id = ?`,
+          reassignedJob.jobId,
+        )
+        .toArray()[0] as { status: string; runner_name: string; github_assignment_observed: number };
+      expect(actual.status).toBe("running");
+      expect(actual.runner_name).toBe(queuedJob.runnerName);
+      expect(actual.github_assignment_observed).toBe(1);
+    });
   });
 
-  it("does not resolve an assignment when GitHub reports no in_progress job on the runner", async () => {
+  it("adopts the running job when its runner was already displaced by a mutual cross-assignment", async () => {
+    const scheduler = env.RUNNER_SCHEDULER.getByName("mutual-cross-assign");
+    const jobA = job("900", "cf-standard-3-job-900", "refs/pull/900/merge");
+    const jobB = job("901", "cf-standard-3-job-901", "refs/pull/901/merge");
+
+    await scheduler.submit(jobA);
+    await scheduler.submit(jobB);
+    await provisionRunner(scheduler, jobA.jobId, jobA.runnerName, 9_001);
+    await provisionRunner(scheduler, jobB.jobId, jobB.runnerName, 9_002);
+
+    // GitHub cross-assigns both runners: RA executes B, RB executes A.
+    await scheduler.workflowJobStarted({
+      jobId: jobB.jobId,
+      runnerName: jobA.runnerName,
+      runnerId: 9_001,
+      target,
+      profile,
+    });
+    // RB's owner row (job B) was just moved onto RA, so nothing owns RB. The
+    // scheduler must still adopt job A onto RB instead of leaving A queued
+    // behind the never-provisioned `RA-r1` runner.
+    await scheduler.workflowJobStarted({
+      jobId: jobA.jobId,
+      runnerName: jobB.runnerName,
+      runnerId: 9_002,
+      target,
+      profile,
+    });
+
+    await expect(scheduler.cacheAssignment(jobB.runnerName, "biw/runner-poc")).resolves.toEqual({
+      jobId: jobA.jobId,
+      cacheScope: {
+        scope: jobA.cacheScope?.scope,
+        fallbackScope: "refs/heads/main",
+        writeAllowed: true,
+      },
+    });
+    await runInDurableObject(scheduler, async (_instance, state) => {
+      // SAFETY: the query selects exactly these two columns and every row carries them.
+      const adopted = state.storage.sql
+        .exec(`SELECT status, runner_name FROM scheduler_jobs WHERE job_id = ?`, jobA.jobId)
+        .toArray()[0] as { status: string; runner_name: string };
+      expect(adopted.status).toBe("running");
+      expect(adopted.runner_name).toBe(jobB.runnerName);
+    });
+  });
+
+  it("does not resolve an assignment when GitHub reports the job on the runner is finished", async () => {
     const scheduler = env.RUNNER_SCHEDULER.getByName("github-reconcile-empty");
     const queuedJob = job("700", "cf-standard-3-job-700", "refs/pull/700/merge");
 
@@ -160,10 +231,12 @@ describe("AccountRunnerScheduler JIT cache assignments", () => {
     await provisionRunner(scheduler, queuedJob.jobId, queuedJob.runnerName, 7_001);
 
     await runInDurableObject(scheduler, async (instance) => {
+      // The runner name matches but the job already completed, so the status
+      // check itself must deny the claim.
       instance.jobDetailOverride = async () => ({
         status: "completed",
-        runner_id: null,
-        runner_name: null,
+        runner_id: 7_001,
+        runner_name: queuedJob.runnerName,
       });
     });
 

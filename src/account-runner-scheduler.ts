@@ -6,6 +6,7 @@ import type { WorkerEnvironment } from "./environment";
 import { githubRunnerTokenFor, type GitHubRepositoryTarget } from "./github-repository";
 import { githubTokenForRunner } from "./github-app";
 import { deleteGitHubRunner, githubHeaders } from "./provision";
+import { startRunnerProvisioningWorkflows } from "./runner-provisioning-workflow";
 import {
   runnerProfileSchema,
   RUNNER_PROFILE_KEYS,
@@ -38,6 +39,10 @@ const SCHEDULER_ALARM_DELAY_MS = 60_000;
 // once per second. The GitHub self-heal below is an escape hatch for lost
 // `in_progress` deliveries, so bound it instead of calling the API per poll.
 const RUNNER_ASSIGNMENT_GITHUB_RECONCILE_INTERVAL_MS = 10_000;
+// Each reconcile probes candidate jobs through the GitHub API with a 5 s
+// per-request timeout; cap the whole sweep so it stays well inside the
+// job-started hook's 30 s budget even when the candidate list is full.
+const RUNNER_ASSIGNMENT_GITHUB_RECONCILE_BUDGET_MS = 8_000;
 const RUNNER_COMPLETION_GRACE_MS = 30_000;
 // GitHub can deliver workflow_job: completed before actions/cache finishes its
 // post-job upload through the runner's local results proxy. Keep the one-job
@@ -355,7 +360,7 @@ function jobMatchesRunnerClaim(job: JobRow, input: SchedulerRunnerClaimInput): b
  * mutations, while Workflows handle only runner start and rollout polling.
  */
 export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
-  private readonly runnerReconcileAttempts = new Map<string, number>();
+  private readonly runnerReconcileAttempts = new Map<string, { timestamp: number; cursor: number }>();
 
   constructor(ctx: DurableObjectState, env: WorkerEnvironment) {
     super(ctx, env);
@@ -1307,14 +1312,22 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     if (runner === undefined) {
       return undefined;
     }
-    const lastAttempt = this.runnerReconcileAttempts.get(runnerName) ?? 0;
+    const attempt = this.runnerReconcileAttempts.get(runnerName) ?? {
+      timestamp: 0,
+      cursor: Number.MAX_SAFE_INTEGER,
+    };
     const timestamp = now();
-    if (timestamp - lastAttempt < RUNNER_ASSIGNMENT_GITHUB_RECONCILE_INTERVAL_MS) {
+    if (timestamp - attempt.timestamp < RUNNER_ASSIGNMENT_GITHUB_RECONCILE_INTERVAL_MS) {
       return undefined;
     }
-    this.runnerReconcileAttempts.set(runnerName, timestamp);
+    attempt.timestamp = timestamp;
+    this.runnerReconcileAttempts.set(runnerName, attempt);
+    const deadline = timestamp + RUNNER_ASSIGNMENT_GITHUB_RECONCILE_BUDGET_MS;
 
     const target: GitHubRepositoryTarget = { owner, repository: repo };
+    // GitHub job ids increase monotonically, so a numeric cursor paginates
+    // the unassigned candidate set across attempts instead of re-probing the
+    // same newest eight rows forever.
     const candidates = this.rows<JobRow>(
       `SELECT * FROM scheduler_jobs
        WHERE lower(github_owner) = lower(?)
@@ -1322,22 +1335,46 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
          AND profile_key = ?
          AND github_assignment_observed = 0
          AND status IN ('queued', 'admitted', 'provisioning', 'running', 'releasing', 'stopped-awaiting-completion')
-       ORDER BY created_at DESC
+         AND CAST(job_id AS INTEGER) < ?
+       ORDER BY CAST(job_id AS INTEGER) DESC
        LIMIT 8`,
       owner,
       repo,
       runner.profile_key,
+      attempt.cursor,
     );
+    if (candidates.length < 8) {
+      attempt.cursor = Number.MAX_SAFE_INTEGER;
+    } else {
+      const last = candidates[candidates.length - 1];
+      if (last !== undefined) {
+        attempt.cursor = Number(last.job_id);
+      }
+    }
     for (const candidate of candidates) {
+      const remaining = deadline - now();
+      if (remaining <= 0) {
+        break;
+      }
+      // The per-job GET carries its own timeout, but installation-token
+      // minting does not; bound the whole lookup by the remaining sweep
+      // budget so the job-started hook's ~30s window cannot be exceeded.
       // eslint-disable-next-line no-await-in-loop -- candidates are probed one at a time and the first match ends the search, so API traffic stays bounded.
-      const detail = await this.fetchGitHubJobDetail(candidate.job_id, target, candidate.github_installation_id);
+      const detail = await Promise.race([
+        this.fetchGitHubJobDetail(candidate.job_id, target, candidate.github_installation_id),
+        new Promise<undefined>((resolve) => setTimeout(resolve, remaining)),
+      ]);
       if (detail === undefined || detail.status !== "in_progress" || detail.runner_name !== runnerName) {
         continue;
       }
       // The candidate could have reached a terminal state while the API call
-      // was in flight; only hand the runner to a job that is still active.
+      // was in flight; only hand the runner to a job that is still waiting
+      // for one.
       const fresh = this.job(candidate.job_id);
-      if (fresh === undefined || (!activeJobStates.has(fresh.status) && fresh.status !== "queued")) {
+      if (
+        fresh === undefined ||
+        (fresh.status !== "queued" && fresh.status !== "admitted" && fresh.status !== "provisioning")
+      ) {
         continue;
       }
       // eslint-disable-next-line no-await-in-loop -- the confirmed assignment is applied through the same sequential ownership transfer as the webhook path.
@@ -1359,6 +1396,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
         jobId: candidate.job_id,
         detail: { runnerName, runnerId: detail.runner_id ?? runner.github_runner_id, via: "github-api" },
       });
+      this.ctx.waitUntil(startRunnerProvisioningWorkflows(this.env, result.admissions));
       const assigned = this.job(candidate.job_id);
       if (assigned !== undefined && assigned.github_assignment_observed === 1 && assigned.cache_scope !== "") {
         return {
@@ -1447,13 +1485,44 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
    * put the displaced job back through normal admission with a fresh JIT name.
    */
   async workflowJobStarted(input: SchedulerRunnerClaimInput): Promise<SchedulerResult> {
-    this.recordJitRunnerAssignment(input);
+    const assignmentRecorded = this.recordJitRunnerAssignment(input);
     const runnerOwner = this.rows<JobRow>(
       `SELECT * FROM scheduler_jobs
        WHERE runner_name = ? AND status IN ('provisioning', 'running', 'releasing')`,
       input.runnerName,
     )[0];
     if (runnerOwner === undefined) {
+      // The runner is ours and GitHub says it executes a job we know, but no
+      // scheduler job still owns the runner — typically a mutual cross-
+      // assignment where both runners were displaced onto each other's jobs.
+      // Attach the runner to the job actually running so the displaced job is
+      // not requeued behind a runner that will never exist.
+      const actualJob = this.job(input.jobId);
+      if (
+        assignmentRecorded &&
+        actualJob !== undefined &&
+        jobMatchesRunnerClaim(actualJob, input) &&
+        (actualJob.status === "queued" || actualJob.status === "admitted" || actualJob.status === "provisioning")
+      ) {
+        this.ctx.storage.sql.exec(
+          `UPDATE scheduler_jobs
+           SET status = 'running', runner_name = ?, runner_id = ?, failure_reason = NULL,
+               container_stopped_at = NULL, container_exit_code = NULL, container_stop_reason = NULL,
+               recovery_due_at = NULL, runner_cleanup_state = 'none', runner_cleanup_due_at = NULL,
+               github_assignment_observed = 1, updated_at = ?
+           WHERE job_id = ?`,
+          input.runnerName,
+          input.runnerId ?? null,
+          now(),
+          actualJob.job_id,
+        );
+        this.recordEvent("github-job-started-adopted-unowned-runner", {
+          jobId: input.jobId,
+          slotId: actualJob.slot_id ?? undefined,
+          detail: { runnerName: input.runnerName, runnerId: input.runnerId },
+        });
+        return { accepted: true, admissions: [] };
+      }
       this.recordEvent("github-job-started-without-owned-job", {
         jobId: input.jobId,
         detail: { runnerName: input.runnerName, runnerId: input.runnerId },
@@ -1555,7 +1624,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     return { accepted: true, admissions };
   }
 
-  private recordJitRunnerAssignment(input: SchedulerRunnerClaimInput): void {
+  private recordJitRunnerAssignment(input: SchedulerRunnerClaimInput): boolean {
     const runner = this.rows<JitRunnerRow>(
       "SELECT * FROM scheduler_jit_runners WHERE runner_name = ?",
       input.runnerName,
@@ -1577,7 +1646,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
           jobRegistered: assignedJob !== undefined,
         },
       });
-      return;
+      return false;
     }
     this.ctx.storage.sql.exec(
       `UPDATE scheduler_jit_runners
@@ -1587,6 +1656,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       now(),
       input.runnerName,
     );
+    return true;
   }
 
   private releaseJob(job: JobRow, status: "completed" | "cancelled" | "failed", reason?: string): void {
