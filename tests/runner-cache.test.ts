@@ -524,6 +524,41 @@ describe("runner R2 cache", () => {
     await expect(assigned.json()).resolves.toEqual({ ok: true });
   });
 
+  it("passes the workflow run hint only after authenticating the runner capability", async () => {
+    const environment = actionCacheEnvironment(actionCacheBucket());
+    const cacheAssignment = vi
+      .fn<(runnerName: string, repository: string, runId?: string) => Promise<TestCacheAssignmentResult>>()
+      .mockResolvedValue({ jobId: "assigned-job", cacheScope: { scope: "refs/pull/2/merge", writeAllowed: true } });
+    const endpoint = "https://runner.example/v1/runner-cache-v2/assignment?run_id=12345";
+    const unauthorized = await handleRunnerCacheV2Request(new Request(endpoint), environment, { cacheAssignment });
+    expect(unauthorized.status).toBe(401);
+    expect(cacheAssignment).not.toHaveBeenCalled();
+    const assigned = await handleRunnerCacheV2Request(
+      new Request(endpoint, {
+        headers: { Authorization: await authorization() },
+      }),
+      environment,
+      { cacheAssignment },
+    );
+    expect(assigned.status).toBe(200);
+    expect(cacheAssignment).toHaveBeenCalledExactlyOnceWith("cf-standard-3-job-42", "biw/example", "12345");
+  });
+
+  it.each(["0", "-1", "1/path", "not-a-run"])("rejects the malformed workflow run hint %s", async (runId) => {
+    const environment = actionCacheEnvironment(actionCacheBucket());
+    const cacheAssignment =
+      vi.fn<(runnerName: string, repository: string, runId?: string) => Promise<TestCacheAssignmentResult>>();
+    const response = await handleRunnerCacheV2Request(
+      new Request(`https://runner.example/v1/runner-cache-v2/assignment?run_id=${encodeURIComponent(runId)}`, {
+        headers: { Authorization: await authorization() },
+      }),
+      environment,
+      { cacheAssignment },
+    );
+    expect(response.status).toBe(400);
+    expect(cacheAssignment).not.toHaveBeenCalled();
+  });
+
   it("implements CacheService v2 lookups and direct archive uploads in R2", async () => {
     const bucket = actionCacheBucket();
     const environment = actionCacheEnvironment(bucket);

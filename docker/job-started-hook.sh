@@ -23,6 +23,13 @@ if [ -z "$cache_endpoint" ] || [ -z "$cache_authorization" ]; then
 fi
 
 assignment_endpoint="${cache_endpoint%/v1/runner-cache}/v1/runner-cache-v2/assignment"
+# The actual workflow run narrows recovery to its jobs when a webhook is lost.
+# Older images omit this hint and retain the scheduler's candidate fallback.
+workflow_run_id=${GITHUB_RUN_ID:-}
+case "$workflow_run_id" in
+  ''|*[!0-9]*|0*) ;;
+  *) assignment_endpoint="$assignment_endpoint?run_id=$workflow_run_id" ;;
+esac
 assignment_max_attempts=${CF_RUNNER_CACHE_ASSIGNMENT_MAX_ATTEMPTS:-30}
 case "$assignment_max_attempts" in
   ''|*[!0-9]*) assignment_max_attempts=30 ;;

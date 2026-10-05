@@ -18,6 +18,7 @@ import { runnerContainerFor } from "./runner-container-router";
 
 export interface RunnerProvisioningWorkflowParameters {
   jobId: string;
+  runnerName?: string;
 }
 
 const apiStepConfig = {
@@ -43,7 +44,7 @@ function schedulerFor(env: WorkerEnvironment) {
 }
 
 interface EligibilityReleaseScheduler {
-  provisioningFailed(jobId: string, reason: string): Promise<{ admissions: SchedulerAdmission[] }>;
+  provisioningFailed(jobId: string, reason: string, runnerName: string): Promise<{ admissions: SchedulerAdmission[] }>;
 }
 
 export interface EligibilityReleaseDependencies {
@@ -72,7 +73,11 @@ export async function releaseIfRepositoryIsIneligible(
     return false;
   }
 
-  const released = await scheduler.provisioningFailed(plan.jobId, `Repository visibility is ${eligibility.visibility}`);
+  const released = await scheduler.provisioningFailed(
+    plan.jobId,
+    `Repository visibility is ${eligibility.visibility}`,
+    plan.runnerName,
+  );
   await dependencies.startProvisioning(env, released.admissions);
   console.log("Cloudflare runner provisioning rejected by repository eligibility", {
     jobId: plan.jobId,
@@ -137,7 +142,7 @@ export async function startRunnerProvisioningWorkflows(
       // eslint-disable-next-line no-await-in-loop -- duplicate IDs are handled before the next job is scheduled.
       await env.RUNNER_PROVISIONING_WORKFLOW.create({
         id: admission.workflowId,
-        params: { jobId: admission.jobId },
+        params: { jobId: admission.jobId, runnerName: admission.runnerName },
         retention: { successRetention: "1 day", errorRetention: "7 days" },
       });
     } catch {
@@ -164,7 +169,7 @@ export class RunnerProvisioningWorkflow extends WorkflowEntrypoint<
     let plan: RunnerProvisioningPlan | undefined;
     for (let attempt = 1; attempt <= 120; attempt += 1) {
       // eslint-disable-next-line no-await-in-loop -- a custom slot may be configuring for an earlier job.
-      const claim = await scheduler.claimProvisioning(event.payload.jobId);
+      const claim = await scheduler.claimProvisioning(event.payload.jobId, event.payload.runnerName);
       if (claim.kind === "provision") {
         plan = claim;
         break;
@@ -199,9 +204,13 @@ export class RunnerProvisioningWorkflow extends WorkflowEntrypoint<
         await startRunnerProvisioningWorkflows(this.env, [...configuredAdmissions, ...capacityAdmissions]);
       }
 
-      const mayStart = await scheduler.canStart(plan.jobId);
+      const mayStart = await scheduler.canStart(plan.jobId, plan.runnerName);
       if (!mayStart) {
-        const released = await scheduler.provisioningFailed(plan.jobId, "GitHub completed before runner provisioning");
+        const released = await scheduler.provisioningFailed(
+          plan.jobId,
+          "GitHub completed before runner provisioning",
+          plan.runnerName,
+        );
         await startRunnerProvisioningWorkflows(this.env, released.admissions);
         return { kind: "cancelled" };
       }
@@ -259,6 +268,7 @@ export class RunnerProvisioningWorkflow extends WorkflowEntrypoint<
       const released = await scheduler.provisioningFailed(
         plan.jobId,
         error instanceof Error ? error.message : "Runner provisioning failed",
+        plan.runnerName,
       );
       await startRunnerProvisioningWorkflows(this.env, released.admissions);
       throw error;
