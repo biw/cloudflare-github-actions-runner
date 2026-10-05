@@ -223,6 +223,34 @@ describe("AccountRunnerScheduler JIT cache assignments", () => {
     });
   });
 
+  it("reconciles a running job whose in_progress webhook was lost", async () => {
+    const scheduler = env.RUNNER_SCHEDULER.getByName("github-reconcile-running");
+    const queuedJob = job("800", "cf-standard-3-job-800", "refs/pull/800/merge");
+
+    await scheduler.submit(queuedJob);
+    await provisionRunner(scheduler, queuedJob.jobId, queuedJob.runnerName, 8_001);
+    // runnerStarted moves the job to `running` before GitHub's in_progress
+    // webhook arrives; a lost delivery must still resolve.
+    await scheduler.runnerStarted(queuedJob.runnerName);
+
+    await runInDurableObject(scheduler, async (instance) => {
+      instance.jobDetailOverride = async () => ({
+        status: "in_progress",
+        runner_id: 8_001,
+        runner_name: queuedJob.runnerName,
+      });
+    });
+
+    await expect(scheduler.cacheAssignment(queuedJob.runnerName, "biw/runner-poc")).resolves.toEqual({
+      jobId: queuedJob.jobId,
+      cacheScope: {
+        scope: queuedJob.cacheScope?.scope,
+        fallbackScope: "refs/heads/main",
+        writeAllowed: true,
+      },
+    });
+  });
+
   it("does not resolve an assignment when GitHub reports the job on the runner is finished", async () => {
     const scheduler = env.RUNNER_SCHEDULER.getByName("github-reconcile-empty");
     const queuedJob = job("700", "cf-standard-3-job-700", "refs/pull/700/merge");

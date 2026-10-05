@@ -1320,6 +1320,14 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     if (timestamp - attempt.timestamp < RUNNER_ASSIGNMENT_GITHUB_RECONCILE_INTERVAL_MS) {
       return undefined;
     }
+    // Entries live only for the duration of a Durable Object instance, but a
+    // long-lived scheduler would otherwise accumulate one entry per claimed
+    // runner forever; drop state for runners that have not polled recently.
+    for (const [name, entry] of this.runnerReconcileAttempts) {
+      if (timestamp - entry.timestamp > 60 * 60 * 1000) {
+        this.runnerReconcileAttempts.delete(name);
+      }
+    }
     attempt.timestamp = timestamp;
     this.runnerReconcileAttempts.set(runnerName, attempt);
     const deadline = timestamp + RUNNER_ASSIGNMENT_GITHUB_RECONCILE_BUDGET_MS;
@@ -1344,36 +1352,39 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       attempt.cursor,
     );
     if (candidates.length < 8) {
+      // Reached the oldest candidate; the next sweep restarts from the newest.
       attempt.cursor = Number.MAX_SAFE_INTEGER;
-    } else {
-      const last = candidates[candidates.length - 1];
-      if (last !== undefined) {
-        attempt.cursor = Number(last.job_id);
-      }
     }
     for (const candidate of candidates) {
       const remaining = deadline - now();
       if (remaining <= 0) {
         break;
       }
-      // The per-job GET carries its own timeout, but installation-token
-      // minting does not; bound the whole lookup by the remaining sweep
-      // budget so the job-started hook's ~30s window cannot be exceeded.
+      const signal = AbortSignal.timeout(remaining);
       // eslint-disable-next-line no-await-in-loop -- candidates are probed one at a time and the first match ends the search, so API traffic stays bounded.
-      const detail = await Promise.race([
-        this.fetchGitHubJobDetail(candidate.job_id, target, candidate.github_installation_id),
-        new Promise<undefined>((resolve) => setTimeout(resolve, remaining)),
-      ]);
+      const detail = await this.fetchGitHubJobDetail(
+        candidate.job_id,
+        target,
+        candidate.github_installation_id,
+        signal,
+      );
+      // Advance the cursor only past candidates actually probed so a deadline
+      // break revisits the unprobed tail instead of skipping it forever.
+      attempt.cursor = Number(candidate.job_id);
       if (detail === undefined || detail.status !== "in_progress" || detail.runner_name !== runnerName) {
         continue;
       }
       // The candidate could have reached a terminal state while the API call
-      // was in flight; only hand the runner to a job that is still waiting
-      // for one.
+      // was in flight; refuse anything past `running` so a finished job is
+      // never resurrected. `runnerStarted` legitimately marks jobs running
+      // before their `in_progress` webhook is observed.
       const fresh = this.job(candidate.job_id);
       if (
         fresh === undefined ||
-        (fresh.status !== "queued" && fresh.status !== "admitted" && fresh.status !== "provisioning")
+        (fresh.status !== "queued" &&
+          fresh.status !== "admitted" &&
+          fresh.status !== "provisioning" &&
+          fresh.status !== "running")
       ) {
         continue;
       }
@@ -1392,6 +1403,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
         });
         return undefined;
       }
+      this.runnerReconcileAttempts.delete(runnerName);
       this.recordEvent("github-assignment-reconciled", {
         jobId: candidate.job_id,
         detail: { runnerName, runnerId: detail.runner_id ?? runner.github_runner_id, via: "github-api" },
@@ -1428,20 +1440,36 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     jobId: string,
     target: GitHubRepositoryTarget,
     installationId: number | null,
+    signal?: AbortSignal,
   ): Promise<GitHubJobDetail | undefined> {
     if (this.jobDetailOverride !== undefined) {
       return this.jobDetailOverride(jobId, target, installationId);
     }
     try {
-      const token = await githubTokenForRunner(this.env, target, installationId, (legacyTarget) =>
-        githubRunnerTokenFor(this.env, legacyTarget),
+      const token = await githubTokenForRunner(
+        this.env,
+        target,
+        installationId,
+        (legacyTarget) => githubRunnerTokenFor(this.env, legacyTarget),
+        // Installation-token minting has no internal timeout; forward the
+        // caller's signal so a hung token request also honors the sweep budget.
+        signal === undefined
+          ? undefined
+          : {
+              fetch: (input, init) => fetch(input, { ...init, signal }),
+              now: () => Date.now(),
+            },
       );
       if (token === undefined) {
         return undefined;
       }
       const response = await fetch(
         `https://api.github.com/repos/${encodeURIComponent(target.owner)}/${encodeURIComponent(target.repository)}/actions/jobs/${encodeURIComponent(jobId)}`,
-        { headers: githubHeaders(token), signal: AbortSignal.timeout(5_000) },
+        {
+          headers: githubHeaders(token),
+          signal:
+            signal === undefined ? AbortSignal.timeout(5_000) : AbortSignal.any([signal, AbortSignal.timeout(5_000)]),
+        },
       );
       if (!response.ok) {
         return undefined;
@@ -1498,11 +1526,14 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       // Attach the runner to the job actually running so the displaced job is
       // not requeued behind a runner that will never exist.
       const actualJob = this.job(input.jobId);
+      // `provisioning` is excluded deliberately: an in-flight provisioning
+      // workflow for that job would observe `canStart() === false` after the
+      // rename and tear the adopted job down via provisioningFailed.
       if (
         assignmentRecorded &&
         actualJob !== undefined &&
         jobMatchesRunnerClaim(actualJob, input) &&
-        (actualJob.status === "queued" || actualJob.status === "admitted" || actualJob.status === "provisioning")
+        (actualJob.status === "queued" || actualJob.status === "admitted" || actualJob.status === "running")
       ) {
         this.ctx.storage.sql.exec(
           `UPDATE scheduler_jobs
