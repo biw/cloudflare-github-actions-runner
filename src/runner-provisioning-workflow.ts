@@ -43,7 +43,7 @@ function schedulerFor(env: WorkerEnvironment) {
 }
 
 interface EligibilityReleaseScheduler {
-  provisioningFailed(jobId: string, reason: string): Promise<{ admissions: SchedulerAdmission[] }>;
+  provisioningFailed(jobId: string, reason: string, runnerName: string): Promise<{ admissions: SchedulerAdmission[] }>;
 }
 
 export interface EligibilityReleaseDependencies {
@@ -72,7 +72,11 @@ export async function releaseIfRepositoryIsIneligible(
     return false;
   }
 
-  const released = await scheduler.provisioningFailed(plan.jobId, `Repository visibility is ${eligibility.visibility}`);
+  const released = await scheduler.provisioningFailed(
+    plan.jobId,
+    `Repository visibility is ${eligibility.visibility}`,
+    plan.runnerName,
+  );
   await dependencies.startProvisioning(env, released.admissions);
   console.log("Cloudflare runner provisioning rejected by repository eligibility", {
     jobId: plan.jobId,
@@ -201,7 +205,11 @@ export class RunnerProvisioningWorkflow extends WorkflowEntrypoint<
 
       const mayStart = await scheduler.canStart(plan.jobId);
       if (!mayStart) {
-        const released = await scheduler.provisioningFailed(plan.jobId, "GitHub completed before runner provisioning");
+        const released = await scheduler.provisioningFailed(
+          plan.jobId,
+          "GitHub completed before runner provisioning",
+          plan.runnerName,
+        );
         await startRunnerProvisioningWorkflows(this.env, released.admissions);
         return { kind: "cancelled" };
       }
@@ -259,6 +267,7 @@ export class RunnerProvisioningWorkflow extends WorkflowEntrypoint<
       const released = await scheduler.provisioningFailed(
         plan.jobId,
         error instanceof Error ? error.message : "Runner provisioning failed",
+        plan.runnerName,
       );
       await startRunnerProvisioningWorkflows(this.env, released.admissions);
       throw error;

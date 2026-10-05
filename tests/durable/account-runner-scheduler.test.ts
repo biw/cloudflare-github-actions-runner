@@ -223,9 +223,9 @@ describe("AccountRunnerScheduler JIT cache assignments", () => {
     });
 
     // A late provisioning workflow for job A's abandoned `RA-r1` runner must
-    // not tear the adopted job down: provisioningFailed only applies to jobs
-    // still in `provisioning`.
-    await scheduler.provisioningFailed(jobA.jobId, "stale workflow");
+    // not tear the adopted job down: provisioningFailed only applies while
+    // the job is still provisioning that exact runner name.
+    await scheduler.provisioningFailed(jobA.jobId, "stale workflow", `${jobA.runnerName}-r1`);
 
     await runInDurableObject(scheduler, async (_instance, state) => {
       // SAFETY: the query selects exactly these two columns and every row carries them.
@@ -234,6 +234,53 @@ describe("AccountRunnerScheduler JIT cache assignments", () => {
         .toArray()[0] as { status: string; runner_name: string };
       expect(surviving.status).toBe("running");
       expect(surviving.runner_name).toBe(jobB.runnerName);
+    });
+  });
+
+  it("ignores a failure report from a superseded provisioning attempt", async () => {
+    const scheduler = env.RUNNER_SCHEDULER.getByName("stale-provisioning-failure");
+    const queuedJob = job("950", "cf-standard-3-job-950", "refs/pull/950/merge");
+    const other = job("951", "cf-standard-3-job-951", "refs/pull/951/merge");
+
+    await scheduler.submit(queuedJob);
+    await scheduler.submit(other);
+    await provisionRunner(scheduler, queuedJob.jobId, queuedJob.runnerName, 9_501);
+    await provisionRunner(scheduler, other.jobId, other.runnerName, 9_502);
+
+    // Cross-assignment: GitHub puts `other` on queuedJob's runner, requeueing
+    // queuedJob under `cf-standard-3-job-950-r1`; the new attempt then claims
+    // provisioning again.
+    await scheduler.workflowJobStarted({
+      jobId: other.jobId,
+      runnerName: queuedJob.runnerName,
+      runnerId: 9_501,
+      target,
+      profile,
+    });
+    // The fresh attempt claims provisioning again under the `-r1` runner
+    // name (claimProvisioning may return `wait` while slot capacity is being
+    // applied, so drive the state directly).
+    await runInDurableObject(scheduler, async (_instance, state) => {
+      state.storage.sql.exec(
+        `UPDATE scheduler_jobs SET status = 'provisioning', updated_at = ? WHERE job_id = ?`,
+        Date.now(),
+        queuedJob.jobId,
+      );
+    });
+
+    // The superseded workflow reports its failure late; the job must not be
+    // failed because its current runner name no longer matches.
+    await scheduler.provisioningFailed(queuedJob.jobId, "stale workflow", queuedJob.runnerName);
+
+    await runInDurableObject(scheduler, async (_instance, state) => {
+      // SAFETY: the query selects exactly these two columns and every row carries them.
+      const surviving = state.storage.sql
+        .exec(`SELECT status, runner_name FROM scheduler_jobs WHERE job_id = ?`, queuedJob.jobId)
+        .toArray()[0] as { status: string; runner_name: string };
+      // The job may legitimately retry further (the test environment fails
+      // real provisioning attempts), but the stale report must not kill it.
+      expect(surviving.status).not.toBe("failed");
+      expect(surviving.runner_name).toMatch(/cf-standard-3-job-950-r\d+/u);
     });
   });
 
