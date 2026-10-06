@@ -4,8 +4,11 @@ import { z } from "zod";
 import { prepareRunnerApplication, reconcileRunnerApplicationCapacity } from "./cloudflare-containers";
 import type { WorkerEnvironment } from "./environment";
 import { githubRunnerTokenFor, type GitHubRepositoryTarget } from "./github-repository";
-import { githubTokenForRunner } from "./github-app";
+import { githubTokenForRunner, type GitHubAppDependencies } from "./github-app";
+import { GitHubJobAssignmentClient, type GitHubJobDetail } from "./github-job-assignment";
 import { deleteGitHubRunner } from "./provision";
+import { assignResourceTraceRunner } from "./resource-traces";
+import { startRunnerProvisioningWorkflows } from "./runner-provisioning-workflow";
 import {
   runnerProfileSchema,
   RUNNER_PROFILE_KEYS,
@@ -26,6 +29,14 @@ import {
 } from "./scheduler-policy";
 
 const SCHEDULER_ALARM_DELAY_MS = 60_000;
+// A running Container's job-started hook polls runner-cache assignment about
+// once per second. The GitHub self-heal below is an escape hatch for lost
+// `in_progress` deliveries, so bound it instead of calling the API per poll.
+const RUNNER_ASSIGNMENT_GITHUB_RECONCILE_INTERVAL_MS = 10_000;
+// Each reconcile probes candidate jobs through the GitHub API with a 5 s
+// per-request timeout; cap the whole sweep so it stays well inside the
+// job-started hook's 30 s budget even when the candidate list is full.
+const RUNNER_ASSIGNMENT_GITHUB_RECONCILE_BUDGET_MS = 8_000;
 const RUNNER_COMPLETION_GRACE_MS = 30_000;
 // GitHub can deliver workflow_job: completed before actions/cache finishes its
 // post-job upload through the runner's local results proxy. Keep the one-job
@@ -98,6 +109,7 @@ interface JobRow {
   updated_at: number;
   runner_id: number | null;
   runner_attempt: number;
+  provisioning_owner_scoped: number;
   failure_reason: string | null;
   container_stopped_at: number | null;
   container_exit_code: number | null;
@@ -156,6 +168,7 @@ interface JitRunnerRow {
   github_owner: string;
   github_repository: string;
   profile_key: string;
+  github_runner_id: number | null;
   assigned_job_id: string | null;
   assignment_observed: number;
   created_at: number;
@@ -342,6 +355,12 @@ function jobMatchesRunnerClaim(job: JobRow, input: SchedulerRunnerClaimInput): b
  * mutations, while Workflows handle only runner start and rollout polling.
  */
 export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
+  private readonly runnerReconcileAttempts = new Map<
+    string,
+    { timestamp: number; cursor: number; runId?: string; page: number }
+  >();
+  assignmentDependencies?: GitHubAppDependencies;
+
   constructor(ctx: DurableObjectState, env: WorkerEnvironment) {
     super(ctx, env);
     ctx.blockConcurrencyWhile(async () => {
@@ -497,6 +516,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       ["cache_write_allowed", "INTEGER NOT NULL DEFAULT 0"],
       ["github_assignment_observed", "INTEGER NOT NULL DEFAULT 0"],
       ["runner_attempt", "INTEGER NOT NULL DEFAULT 1"],
+      ["provisioning_owner_scoped", "INTEGER NOT NULL DEFAULT 0"],
       ["container_stopped_at", "INTEGER"],
       ["container_exit_code", "INTEGER"],
       ["container_stop_reason", "TEXT"],
@@ -508,6 +528,14 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     for (const [name, definition] of jobColumnMigrations) {
       if (!jobColumns.some((column) => column.name === name)) {
         this.ctx.storage.sql.exec(`ALTER TABLE scheduler_jobs ADD COLUMN ${name} ${definition}`);
+      }
+    }
+
+    const jitRunnerColumns = this.rows<{ name: string }>("PRAGMA table_info(scheduler_jit_runners)");
+    const jitRunnerColumnMigrations = [["github_runner_id", "INTEGER"]] as const;
+    for (const [name, definition] of jitRunnerColumnMigrations) {
+      if (!jitRunnerColumns.some((column) => column.name === name)) {
+        this.ctx.storage.sql.exec(`ALTER TABLE scheduler_jit_runners ADD COLUMN ${name} ${definition}`);
       }
     }
     // Jobs that were queued before the pool became multi-repository belong to
@@ -968,10 +996,13 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     return { accepted: true, queueReason: stored === undefined ? undefined : this.queueReason(stored), admissions };
   }
 
-  async claimProvisioning(jobId: string): Promise<SchedulerProvisioningClaim> {
+  async claimProvisioning(jobId: string, runnerName?: string): Promise<SchedulerProvisioningClaim> {
     const job = this.job(jobId);
     if (job === undefined) {
       return { kind: "missing" };
+    }
+    if (runnerName !== undefined && job.runner_name !== runnerName) {
+      return { kind: "cancelled" };
     }
     if (job.status === "queued" || job.status === "admitted") {
       if (job.slot_id === null) {
@@ -993,7 +1024,8 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
         return { kind: "wait" };
       }
       this.ctx.storage.sql.exec(
-        "UPDATE scheduler_jobs SET status = 'provisioning', updated_at = ? WHERE job_id = ?",
+        "UPDATE scheduler_jobs SET status = 'provisioning', provisioning_owner_scoped = ?, updated_at = ? WHERE job_id = ?",
+        runnerName === undefined ? 0 : 1,
         now(),
         jobId,
       );
@@ -1116,9 +1148,9 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     return admissions;
   }
 
-  async canStart(jobId: string): Promise<boolean> {
+  async canStart(jobId: string, runnerName?: string): Promise<boolean> {
     const job = this.job(jobId);
-    return job?.status === "provisioning";
+    return job?.status === "provisioning" && (runnerName === undefined || job.runner_name === runnerName);
   }
 
   async runnerProvisioned(jobId: string, runnerName: string, runnerId: number): Promise<void> {
@@ -1143,13 +1175,14 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     const timestamp = now();
     this.ctx.storage.sql.exec(
       `INSERT INTO scheduler_jit_runners
-       (runner_name, source_job_id, github_owner, github_repository, profile_key, assigned_job_id, assignment_observed, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, NULL, 0, ?, ?)
+       (runner_name, source_job_id, github_owner, github_repository, profile_key, github_runner_id, assigned_job_id, assignment_observed, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, NULL, 0, ?, ?)
        ON CONFLICT(runner_name) DO UPDATE SET
          source_job_id = excluded.source_job_id,
          github_owner = excluded.github_owner,
          github_repository = excluded.github_repository,
          profile_key = excluded.profile_key,
+         github_runner_id = excluded.github_runner_id,
          assigned_job_id = NULL,
          assignment_observed = 0,
          updated_at = excluded.updated_at`,
@@ -1158,6 +1191,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       job.github_owner,
       job.github_repository,
       job.profile_key,
+      runnerId,
       timestamp,
       timestamp,
     );
@@ -1191,6 +1225,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
   async cacheAssignment(
     runnerName: string,
     repository: string,
+    runId?: string,
   ): Promise<
     | {
         jobId: string;
@@ -1246,14 +1281,227 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       repo,
       now() - RUNNER_CACHE_POST_JOB_GRACE_MS,
     )[0];
-    if (job === undefined || job.github_assignment_observed === 0 || job.cache_scope === "") {
+    if (job !== undefined && job.github_assignment_observed === 1 && job.cache_scope !== "") {
+      return {
+        jobId: job.job_id,
+        cacheScope: storedCacheScope(job.cache_scope, job.cache_fallback_scope, job.cache_write_allowed),
+      };
+    }
+    if (runId !== undefined && !/^[1-9][0-9]*$/u.test(runId)) {
+      return undefined;
+    }
+    return this.reconcileRunnerAssignmentFromGitHub(runnerName, owner, repo, runId);
+  }
+
+  /**
+   * `workflow_job: in_progress` is the authoritative runner-to-job assignment,
+   * but GitHub does not re-deliver webhooks the Worker drops or fails to
+   * acknowledge, so a lost delivery leaves a running job polling for its
+   * assignment until the job-started hook times out. New hooks provide their
+   * actual workflow run, whose jobs can be listed without scanning unrelated
+   * queued jobs. Older hooks retain a deadline-bounded candidate scan. Both
+   * paths require GitHub to confirm this runner and use the webhook's
+   * ownership-transfer and resource-attribution paths.
+   */
+  private async reconcileRunnerAssignmentFromGitHub(
+    runnerName: string,
+    owner: string,
+    repo: string,
+    runId?: string,
+  ): Promise<{ jobId: string; cacheScope: SchedulerCacheScope } | undefined> {
+    const runner = this.rows<JitRunnerRow>(
+      `SELECT * FROM scheduler_jit_runners
+       WHERE runner_name = ?
+         AND lower(github_owner) = lower(?)
+         AND lower(github_repository) = lower(?)`,
+      runnerName,
+      owner,
+      repo,
+    )[0];
+    if (runner === undefined) {
+      return undefined;
+    }
+    const attempt: { timestamp: number; cursor: number; runId?: string; page: number } =
+      this.runnerReconcileAttempts.get(runnerName) ?? {
+        timestamp: 0,
+        cursor: Number.MAX_SAFE_INTEGER,
+        page: 1,
+      };
+    const timestamp = this.assignmentNow();
+    if (timestamp - attempt.timestamp < RUNNER_ASSIGNMENT_GITHUB_RECONCILE_INTERVAL_MS) {
+      return undefined;
+    }
+    // Entries live only for the duration of a Durable Object instance, but a
+    // long-lived scheduler would otherwise accumulate one entry per claimed
+    // runner forever; drop state for runners that have not polled recently.
+    for (const [name, entry] of this.runnerReconcileAttempts) {
+      if (timestamp - entry.timestamp > 60 * 60 * 1000) {
+        this.runnerReconcileAttempts.delete(name);
+      }
+    }
+    attempt.timestamp = timestamp;
+    if (attempt.runId !== runId) {
+      attempt.runId = runId;
+      attempt.page = 1;
+    }
+    this.runnerReconcileAttempts.set(runnerName, attempt);
+    const deadline = timestamp + RUNNER_ASSIGNMENT_GITHUB_RECONCILE_BUDGET_MS;
+
+    const target: GitHubRepositoryTarget = { owner, repository: repo };
+    const client = new GitHubJobAssignmentClient(this.env, target, this.assignmentDependencies);
+    if (runId !== undefined) {
+      const sourceJob = this.job(runner.source_job_id);
+      if (sourceJob === undefined) {
+        return undefined;
+      }
+      while (this.assignmentNow() < deadline) {
+        const remaining = deadline - this.assignmentNow();
+        if (remaining <= 0) {
+          return undefined;
+        }
+        // eslint-disable-next-line no-await-in-loop -- page requests stop as soon as this runner is found or the sweep deadline expires.
+        const page = await client.workflowJobs(
+          runId,
+          attempt.page,
+          sourceJob.github_installation_id,
+          AbortSignal.timeout(remaining),
+        );
+        if (page === undefined) {
+          return undefined;
+        }
+        const detail = page.jobs.find((job) => job.status === "in_progress" && job.runner_name === runnerName);
+        if (detail !== undefined) {
+          return this.applyReconciledAssignment(runner, String(detail.id), detail, target);
+        }
+        if (page.jobs.length < 100 || attempt.page * 100 >= page.total_count) {
+          attempt.page = 1;
+          return undefined;
+        }
+        attempt.page += 1;
+      }
+      return undefined;
+    }
+
+    // SQL pages bound memory, not the number of candidates reachable per
+    // sweep. Keep probing pages while the deadline permits, and resume after
+    // the last actually probed row when a slow request exhausts the budget.
+    while (this.assignmentNow() < deadline) {
+      const candidates = this.rows<JobRow>(
+        `SELECT * FROM scheduler_jobs
+       WHERE lower(github_owner) = lower(?)
+         AND lower(github_repository) = lower(?)
+         AND profile_key = ?
+         AND github_assignment_observed = 0
+         AND status IN ('queued', 'admitted', 'provisioning', 'running')
+         AND CAST(job_id AS INTEGER) < ?
+       ORDER BY CAST(job_id AS INTEGER) DESC
+       LIMIT 9`,
+        owner,
+        repo,
+        runner.profile_key,
+        attempt.cursor,
+      );
+      // One lookahead row tells us whether a full eight-row page is also
+      // the final page, even if its last probe consumes the whole budget.
+      for (const candidate of candidates.slice(0, 8)) {
+        const remaining = deadline - this.assignmentNow();
+        if (remaining <= 0) {
+          return undefined;
+        }
+        const signal = AbortSignal.timeout(remaining);
+        // eslint-disable-next-line no-await-in-loop -- sequential probes share a credential and stop at the first match or deadline.
+        const detail = await (this.jobDetailOverride === undefined
+          ? client.jobDetail(candidate.job_id, candidate.github_installation_id, signal)
+          : this.jobDetailOverride(candidate.job_id, target, candidate.github_installation_id));
+        attempt.cursor = Number(candidate.job_id);
+        if (detail?.status === "in_progress" && detail.runner_name === runnerName) {
+          // eslint-disable-next-line no-await-in-loop -- assignment validation follows the authoritative API response.
+          const result = await this.applyReconciledAssignment(runner, candidate.job_id, detail, target);
+          if (result !== undefined) {
+            return result;
+          }
+        }
+      }
+      if (candidates.length <= 8) {
+        // Reset only after fully consuming this page; an interrupted page
+        // must retain its cursor so its unprobed tail is revisited.
+        attempt.cursor = Number.MAX_SAFE_INTEGER;
+        return undefined;
+      }
+    }
+    return undefined;
+  }
+
+  private assignmentNow(): number {
+    return this.assignmentDependencies?.now() ?? now();
+  }
+
+  private async applyReconciledAssignment(
+    runner: JitRunnerRow,
+    jobId: string,
+    detail: GitHubJobDetail,
+    target: GitHubRepositoryTarget,
+  ): Promise<{ jobId: string; cacheScope: SchedulerCacheScope } | undefined> {
+    const fresh = this.job(jobId);
+    if (
+      fresh === undefined ||
+      !["queued", "admitted", "provisioning", "running"].includes(fresh.status) ||
+      fresh.github_owner.toLowerCase() !== target.owner.toLowerCase() ||
+      fresh.github_repository.toLowerCase() !== target.repository.toLowerCase() ||
+      fresh.profile_key !== runner.profile_key ||
+      detail.runner_id === 0
+    ) {
+      return undefined;
+    }
+    const result = await this.workflowJobStarted({
+      jobId,
+      runnerName: runner.runner_name,
+      runnerId: detail.runner_id ?? runner.github_runner_id ?? undefined,
+      target,
+      profile: parseProfile(fresh.profile_json),
+    });
+    if (!result.accepted) {
+      this.recordEvent("jit-runner-assignment-unreconciled", {
+        jobId,
+        detail: { runnerName: runner.runner_name, sourceJobId: runner.source_job_id },
+      });
+      return undefined;
+    }
+    this.runnerReconcileAttempts.delete(runner.runner_name);
+    this.recordEvent("github-assignment-reconciled", {
+      jobId,
+      detail: {
+        runnerName: runner.runner_name,
+        runnerId: detail.runner_id ?? runner.github_runner_id,
+        via: "github-api",
+      },
+    });
+    this.ctx.waitUntil(startRunnerProvisioningWorkflows(this.env, result.admissions));
+    await assignResourceTraceRunner(this.env, {
+      runnerName: runner.runner_name,
+      jobId,
+      repository: `${target.owner}/${target.repository}`,
+    });
+    const assigned = this.job(jobId);
+    if (assigned === undefined || assigned.github_assignment_observed !== 1 || assigned.cache_scope === "") {
       return undefined;
     }
     return {
-      jobId: job.job_id,
-      cacheScope: storedCacheScope(job.cache_scope, job.cache_fallback_scope, job.cache_write_allowed),
+      jobId,
+      cacheScope: storedCacheScope(assigned.cache_scope, assigned.cache_fallback_scope, assigned.cache_write_allowed),
     };
   }
+
+  /**
+   * Authoritative state of a single workflow job. The `jobDetailOverride`
+   * seam exists so tests can answer without real API credentials or network
+   * access.
+   */
+  jobDetailOverride?: (
+    jobId: string,
+    target: GitHubRepositoryTarget,
+    installationId: number | null,
+  ) => Promise<GitHubJobDetail | undefined>;
 
   /** @deprecated Use cacheAssignment, which follows a JIT runner's actual job. */
   async cacheScope(runnerName: string, repository: string, jobId: string): Promise<SchedulerCacheScope | undefined> {
@@ -1287,13 +1535,51 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
    * put the displaced job back through normal admission with a fresh JIT name.
    */
   async workflowJobStarted(input: SchedulerRunnerClaimInput): Promise<SchedulerResult> {
-    this.recordJitRunnerAssignment(input);
+    const assignmentRecorded = this.recordJitRunnerAssignment(input);
     const runnerOwner = this.rows<JobRow>(
       `SELECT * FROM scheduler_jobs
        WHERE runner_name = ? AND status IN ('provisioning', 'running', 'releasing')`,
       input.runnerName,
     )[0];
     if (runnerOwner === undefined) {
+      // The runner is ours and GitHub says it executes a job we know, but no
+      // scheduler job still owns the runner — typically a mutual cross-
+      // assignment where both runners were displaced onto each other's jobs.
+      // Attach the runner to the job actually running so the displaced job is
+      // not requeued behind a runner that will never exist.
+      const actualJob = this.job(input.jobId);
+      // `provisioning` is excluded deliberately: an in-flight provisioning
+      // workflow for that job would observe `canStart() === false` after the
+      // rename and tear the adopted job down via provisioningFailed.
+      if (
+        assignmentRecorded &&
+        actualJob !== undefined &&
+        jobMatchesRunnerClaim(actualJob, input) &&
+        (actualJob.status === "queued" || actualJob.status === "admitted" || actualJob.status === "running")
+      ) {
+        this.ctx.storage.sql.exec(
+          `UPDATE scheduler_jobs
+           SET status = 'running', runner_name = ?, runner_id = ?, failure_reason = NULL,
+               container_stopped_at = NULL, container_exit_code = NULL, container_stop_reason = NULL,
+               recovery_due_at = NULL, runner_cleanup_state = 'none', runner_cleanup_due_at = NULL,
+               github_assignment_observed = 1, updated_at = ?
+           WHERE job_id = ?`,
+          input.runnerName,
+          input.runnerId ?? null,
+          now(),
+          actualJob.job_id,
+        );
+        this.recordEvent("github-job-started-adopted-unowned-runner", {
+          jobId: input.jobId,
+          slotId: actualJob.slot_id ?? undefined,
+          detail: { runnerName: input.runnerName, runnerId: input.runnerId },
+        });
+        return { accepted: true, admissions: [] };
+      }
+      this.recordEvent("github-job-started-without-owned-job", {
+        jobId: input.jobId,
+        detail: { runnerName: input.runnerName, runnerId: input.runnerId },
+      });
       return { accepted: false, admissions: [] };
     }
 
@@ -1391,7 +1677,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     return { accepted: true, admissions };
   }
 
-  private recordJitRunnerAssignment(input: SchedulerRunnerClaimInput): void {
+  private recordJitRunnerAssignment(input: SchedulerRunnerClaimInput): boolean {
     const runner = this.rows<JitRunnerRow>(
       "SELECT * FROM scheduler_jit_runners WHERE runner_name = ?",
       input.runnerName,
@@ -1405,7 +1691,15 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       runner.profile_key !== input.profile.key ||
       !jobMatchesRunnerClaim(assignedJob, input)
     ) {
-      return;
+      this.recordEvent("jit-runner-assignment-unmatched", {
+        jobId: input.jobId,
+        detail: {
+          runnerName: input.runnerName,
+          runnerRegistered: runner !== undefined,
+          jobRegistered: assignedJob !== undefined,
+        },
+      });
+      return false;
     }
     this.ctx.storage.sql.exec(
       `UPDATE scheduler_jit_runners
@@ -1415,6 +1709,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       now(),
       input.runnerName,
     );
+    return true;
   }
 
   private releaseJob(job: JobRow, status: "completed" | "cancelled" | "failed", reason?: string): void {
@@ -1465,9 +1760,29 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     });
   }
 
-  async provisioningFailed(jobId: string, reason: string): Promise<SchedulerResult> {
+  async provisioningFailed(jobId: string, reason: string, runnerName?: string): Promise<SchedulerResult> {
     const job = this.job(jobId);
-    if (job === undefined || !activeJobStates.has(job.status)) {
+    // Only the workflow that owns the current provisioning attempt may fail
+    // the job. A stale or retried workflow — identifiable by the runner name
+    // from its claim, which embeds the `-rN` attempt suffix — must never tear
+    // down a job that already moved on (adopted onto a different JIT runner
+    // after a GitHub cross-assignment) or was re-queued and claimed again.
+    // During deployment, old workflows still send two arguments. An
+    // unscoped failure is accepted only for an attempt claimed through the
+    // legacy protocol. New workflows persist scoped ownership when claiming,
+    // so an old workflow cannot fail a replacement attempt.
+    const ownsAttempt =
+      job !== undefined &&
+      (runnerName === undefined
+        ? job.provisioning_owner_scoped === 0 && job.github_assignment_observed === 0
+        : job.runner_name === runnerName);
+    if (job === undefined || job.status !== "provisioning" || !ownsAttempt) {
+      if (job !== undefined && activeJobStates.has(job.status)) {
+        this.recordEvent("provisioning-failed-ignored", {
+          jobId,
+          detail: { status: job.status, runnerName, currentRunnerName: job.runner_name, reason },
+        });
+      }
       return { accepted: false, admissions: [] };
     }
     this.releaseJob(job, "failed", reason);
@@ -1904,7 +2219,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
         // eslint-disable-next-line no-await-in-loop -- deterministic workflow IDs make each admission idempotent.
         await this.env.RUNNER_PROVISIONING_WORKFLOW.create({
           id: admission.workflowId,
-          params: { jobId: admission.jobId },
+          params: { jobId: admission.jobId, runnerName: admission.runnerName },
           retention: { successRetention: "1 day", errorRetention: "7 days" },
         });
       } catch {

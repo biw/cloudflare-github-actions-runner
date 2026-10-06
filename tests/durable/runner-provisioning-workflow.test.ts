@@ -38,7 +38,7 @@ describe("delayed runner repository authorization", () => {
         { jobId: "next", runnerName: "cf-standard-3-job-next", workflowId: "runner-next" },
       ];
       const provisioningFailed = vi
-        .fn<(jobId: string, reason: string) => Promise<{ admissions: SchedulerAdmission[] }>>()
+        .fn<(jobId: string, reason: string, runnerName: string) => Promise<{ admissions: SchedulerAdmission[] }>>()
         .mockResolvedValue({ admissions });
       const dependencies: EligibilityReleaseDependencies = {
         authorize: vi.fn<EligibilityReleaseDependencies["authorize"]>().mockResolvedValue({
@@ -58,14 +58,18 @@ describe("delayed runner repository authorization", () => {
         target: plan.target,
         installationId: plan.installationId,
       });
-      expect(provisioningFailed).toHaveBeenCalledExactlyOnceWith(plan.jobId, `Repository visibility is ${visibility}`);
+      expect(provisioningFailed).toHaveBeenCalledExactlyOnceWith(
+        plan.jobId,
+        `Repository visibility is ${visibility}`,
+        plan.runnerName,
+      );
       expect(dependencies.startProvisioning).toHaveBeenCalledExactlyOnceWith(testEnvironment, admissions);
     },
   );
 
   it("keeps a private reservation without releasing or starting another workflow", async () => {
     const provisioningFailed =
-      vi.fn<(jobId: string, reason: string) => Promise<{ admissions: SchedulerAdmission[] }>>();
+      vi.fn<(jobId: string, reason: string, runnerName: string) => Promise<{ admissions: SchedulerAdmission[] }>>();
     const dependencies: EligibilityReleaseDependencies = {
       authorize: vi.fn<EligibilityReleaseDependencies["authorize"]>().mockResolvedValue({ kind: "private" }),
       startProvisioning: vi.fn<EligibilityReleaseDependencies["startProvisioning"]>(),
