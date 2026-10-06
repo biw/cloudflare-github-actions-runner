@@ -87,6 +87,9 @@ export default defineConfig({
             miniflare: {
               bindings: {
                 RUNNER_CACHE_MAX_BYTES: "20",
+                LEGACY_GITHUB_OWNER: "biw",
+                LEGACY_GITHUB_REPOSITORY: "runner-poc",
+                GITHUB_RUNNER_TOKEN: "assignment-test-token",
               },
             },
             wrangler: { configPath: "./wrangler.jsonc" },

@@ -66,14 +66,14 @@ const githubJitConfigSchema = z.object({
 });
 const githubErrorResponseSchema = z.object({ message: z.string().optional() });
 
-const githubHeaders = (token: string): HeadersInit => ({
+export const githubHeaders = (token: string): HeadersInit => ({
   Accept: "application/vnd.github+json",
   Authorization: `Bearer ${token}`,
   "User-Agent": "cloudflare-github-actions-runner",
   "X-GitHub-Api-Version": "2022-11-28",
 });
 
-function githubRunnerUrl(target: GitHubRepositoryTarget, suffix = ""): string {
+export function githubRunnerUrl(target: GitHubRepositoryTarget, suffix = ""): string {
   return `https://api.github.com/repos/${encodeURIComponent(target.owner)}/${encodeURIComponent(target.repository)}/actions/runners${suffix}`;
 }
 
